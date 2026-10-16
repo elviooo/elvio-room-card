@@ -122,6 +122,7 @@ Pflicht je Karte: `title` und mindestens eine Kachel in `tiles`.
 | `service` | `path`, `url` oder `config_flow`; optional `state_text` |
 | `now_playing`, `search`, `tablet_room` | – |
 | `automations` | `templates` |
+| `fuel` | `stations` (Liste mit `name`, `e5`, `e10`, `diesel` – Preis-Sensoren, z. B. Tankerkönig), optional `default` (`e5`/`e10`/`diesel`), `hours` (Verlauf, Standard 48) |
 
 ## Schritt 4: Einfügen (wenn der Connector keine Dashboards speichern kann)
 

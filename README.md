@@ -57,6 +57,7 @@ die eigene Installation angepasst werden.
 | `service` | `path`, `url` oder `config_flow` |
 | `now_playing`, `search`, `tablet_room` | – |
 | `automations` | `templates` |
+| `fuel` | `stations` (Liste mit `name`, `e5`, `e10`, `diesel` – Preis-Sensoren, z. B. Tankerkönig), optional `default` (`e5`/`e10`/`diesel`), `hours` (Verlauf, Standard 48) |
 
 Weitere Kacheln lassen sich unter `sections` gruppieren (`title` + `tiles`).
 
