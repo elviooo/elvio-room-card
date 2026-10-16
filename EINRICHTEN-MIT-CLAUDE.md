@@ -140,7 +140,9 @@ Dem Nutzer Schritt für Schritt erklären:
 
 ## Schritt 5: Zusatzfunktionen einrichten
 
-Immer eine Ansicht „Einstellungen“ mit der Kachel `{type: setup}` anlegen. Dort richtet der
+Immer eine Ansicht „Einstellungen“ mit den Kacheln `{type: setup}` und
+`{type: automations, name: Automationen, templates: []}` anlegen (alle Automationen ein/aus,
+für Admins Bearbeiten und Neu). Dort richtet der
 Nutzer mit einem Tipp ein, was außerhalb der Karte installiert werden muss: Music Assistant,
 Seitenleiste ausblenden (kiosk-mode), Startseite für alle, Karten-Update, Tank-Push. Weise den
 Nutzer darauf hin; installiere diese Dinge nicht selbst über den Connector, ohne zu fragen.
