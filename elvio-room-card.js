@@ -1690,7 +1690,7 @@ class ElvioRoomCard extends HTMLElement {
   // ───────────── Einrichtung ─────────────
 
   _dashPath() {
-    return location.pathname.split("/")[1] || "lovelace";
+    return (this._hass && this._hass.panelUrl) || location.pathname.split("/")[1] || "lovelace";
   }
 
   _ensureSetup() {
@@ -1919,10 +1919,9 @@ class ElvioRoomCard extends HTMLElement {
     const again = el("button", "stextbtn", "Neu prüfen");
     again.addEventListener("click", () => this._openSetup());
     this._editActions.appendChild(again);
-    if (this._setupError) {
-      this._editMsg.textContent = `Prüfung fehlgeschlagen: ${this._setupError}`;
-      this._editMsg.hidden = false;
-    }
+    // Eine Meldung aus einer früheren, fehlgeschlagenen Prüfung darf nicht stehen bleiben.
+    this._editMsg.hidden = !this._setupError;
+    if (this._setupError) this._editMsg.textContent = `Prüfung fehlgeschlagen: ${this._setupError}`;
     if (!setupCache) {
       list.appendChild(el("div", "ag-empty", "Wird geprüft …"));
       return;
