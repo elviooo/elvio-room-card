@@ -58,10 +58,27 @@ die eigene Installation angepasst werden.
 | `now_playing`, `search`, `tablet_room` | – |
 | `automations` | `templates` |
 | `fuel` | `stations` (Liste mit `name`, `e5`, `e10`, `diesel` – Preis-Sensoren, z. B. Tankerkönig), optional `default` (`e5`/`e10`/`diesel`), `hours` (Verlauf, Standard 48) |
+| `setup` | – (nur für Admins bedienbar, siehe „Einrichtung auf Knopfdruck“) |
 
 Weitere Kacheln lassen sich unter `sections` gruppieren (`title` + `tiles`).
 
-### Tipp fürs Wandtablet
+## Einrichtung auf Knopfdruck
 
-Die Karte legt sich über Kopf- und Seitenleiste. Wer sie ganz ausblenden will, nimmt dazu
-[kiosk-mode](https://github.com/NemesisRE/kiosk-mode) (ebenfalls über HACS).
+Manches gehört zur Karte, muss aber außerhalb installiert werden. Die Kachel `setup` (am
+besten in einer Ansicht „Einstellungen“) prüft das und richtet es auf Knopfdruck ein:
+
+| Punkt | Was passiert |
+|---|---|
+| Raumkarte aktuell | Neue Version über HACS laden |
+| Seitenleiste ausblenden | [kiosk-mode](https://github.com/NemesisRE/kiosk-mode) über HACS installieren, Kopf- und Seitenleiste in diesem Dashboard ausblenden (`?disable_km` zum Bearbeiten) |
+| Startseite für alle | Dieses Dashboard öffnet beim Start der App |
+| Music Assistant | Add-on installieren, starten, mit Home Assistant verbinden (nur Home Assistant OS) |
+| Push: günstig tanken | Nur mit Tankerkönig: Sorte und Empfänger wählen, Sensoren und Automation werden angelegt |
+
+```yaml
+- {type: setup}
+```
+
+Fehlt etwas, zeigt die Karte Admins oben einen Hinweis „2 offen“ (abschalten mit
+`setup_hint: false`). Ohne Admin-Anmeldung sieht man davon nichts, und nichts wird ungefragt
+installiert.

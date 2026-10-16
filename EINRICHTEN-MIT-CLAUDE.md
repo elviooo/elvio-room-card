@@ -123,6 +123,7 @@ Pflicht je Karte: `title` und mindestens eine Kachel in `tiles`.
 | `now_playing`, `search`, `tablet_room` | – |
 | `automations` | `templates` |
 | `fuel` | `stations` (Liste mit `name`, `e5`, `e10`, `diesel` – Preis-Sensoren, z. B. Tankerkönig), optional `default` (`e5`/`e10`/`diesel`), `hours` (Verlauf, Standard 48) |
+| `setup` | – |
 
 ## Schritt 4: Einfügen (wenn der Connector keine Dashboards speichern kann)
 
@@ -137,13 +138,9 @@ Dem Nutzer Schritt für Schritt erklären:
    oder der Browser hält den alten Stand: Seite neu laden (in der App: Einstellungen →
    Companion App → Frontend-Cache leeren).
 
-Optional für ein Wandtablet: [kiosk-mode](https://github.com/NemesisRE/kiosk-mode) über HACS
-installieren und oben in die YAML schreiben:
+## Schritt 5: Zusatzfunktionen einrichten
 
-```yaml
-kiosk_mode:
-  hide_header: true
-  hide_sidebar: true
-```
-
-Zum Bearbeiten danach `?disable_km` an die Adresse hängen.
+Immer eine Ansicht „Einstellungen“ mit der Kachel `{type: setup}` anlegen. Dort richtet der
+Nutzer mit einem Tipp ein, was außerhalb der Karte installiert werden muss: Music Assistant,
+Seitenleiste ausblenden (kiosk-mode), Startseite für alle, Karten-Update, Tank-Push. Weise den
+Nutzer darauf hin; installiere diese Dinge nicht selbst über den Connector, ohne zu fragen.
