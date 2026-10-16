@@ -43,6 +43,15 @@ const AGENDA_REFRESH_MS = 5 * 60 * 1000;
 // Spritpreise ändern sich über den Tag mehrfach; der Verlauf fürs Minidiagramm wird
 // nicht bei jedem Zustandswechsel, sondern in diesem Takt neu geholt.
 const FUEL_REFRESH_MS = 15 * 60 * 1000;
+// Einrichtung: was zur Karte gehört, aber außerhalb der Karte installiert werden muss.
+const SETUP_TTL_MS = 10 * 60 * 1000;
+const SETUP_CARD_REPO = "elviooo/elvio-room-card";
+const SETUP_KIOSK_REPO = "NemesisRE/kiosk-mode";
+const SETUP_MA_SLUG = "d5369777_music_assistant";
+const SETUP_MA_STORE = "https://github.com/music-assistant/home-assistant-addon";
+// Ein Stand für alle Ansichten: sonst fragt jede Ansicht HACS und Supervisor neu.
+let setupCache = null;
+let setupRunning = null;
 const FUEL_KINDS = [
   { key: "e5", label: "Super E5" },
   { key: "e10", label: "E10" },
@@ -118,6 +127,10 @@ function icon(name) {
   return node;
 }
 
+function setupErrText(err) {
+  return (err && ((err.body && err.body.message) || err.message || err.code)) || String(err);
+}
+
 class ElvioRoomCard extends HTMLElement {
   setConfig(config) {
     if (!config.title) throw new Error("title fehlt");
@@ -144,7 +157,7 @@ class ElvioRoomCard extends HTMLElement {
       if (tile.type === "automations" && !Array.isArray(tile.templates)) {
         throw new Error(`Automationen-Kachel braucht templates: ${JSON.stringify(tile)}`);
       }
-      if (!["lights", "service", "account", "now_playing", "search", "agenda", "energy", "tablet_room", "automations", "fuel"].includes(tile.type) && !tile.entity) {
+      if (!["lights", "service", "account", "now_playing", "search", "agenda", "energy", "tablet_room", "automations", "fuel", "setup"].includes(tile.type) && !tile.entity) {
         throw new Error(`Kachel ohne Entität: ${JSON.stringify(tile)}`);
       }
       if (tile.type === "service" && !tile.path && !tile.config_flow && !tile.url) {
@@ -885,6 +898,13 @@ class ElvioRoomCard extends HTMLElement {
         );
         break;
       }
+      case "setup": {
+        const ic = el("div", "icon");
+        ic.appendChild(icon(cfg.icon || "mdi:auto-fix"));
+        node.appendChild(ic);
+        node.addEventListener("click", () => this._openSetup());
+        break;
+      }
       case "automations": {
         const ic = el("div", "icon");
         ic.appendChild(icon(cfg.icon || "mdi:robot-outline"));
@@ -1079,6 +1099,13 @@ class ElvioRoomCard extends HTMLElement {
     }
 
     // Nur neu zeichnen, wenn sich etwas geändert hat – sonst flackern Avatare.
+    // Admins sehen, wenn zur Karte gehörende Funktionen noch fehlen – sonst weiß niemand,
+    // dass es sie gibt.
+    if (hass.user && hass.user.is_admin && this._config.setup_hint !== false) {
+      this._ensureSetup();
+      const open = setupCache ? setupCache.items.filter((i) => !i.done).length : 0;
+      if (open) chips.push({ id: "setup", kind: "entity", icon: "mdi:auto-fix", title: `${open} offen`, sub: "Einrichtung" });
+    }
     const key = JSON.stringify(chips);
     if (key === this._chipsKey) return;
     this._chipsKey = key;
@@ -1087,7 +1114,9 @@ class ElvioRoomCard extends HTMLElement {
       // Antippbar: öffnet den HA-Dialog (Person: Standort/Verlauf, Musik: Lautstärke,
       // Quelle, Gruppieren, Sensor: Verlauf).
       const node = el("button", `chip ${chip.kind}`);
-      node.addEventListener("click", () => (chip.id === "offen" ? this._openOpenThings() : this._moreInfo(chip.id)));
+      node.addEventListener("click", () =>
+        chip.id === "offen" ? this._openOpenThings() : chip.id === "setup" ? this._openSetup() : this._moreInfo(chip.id),
+      );
       const av = el("div", "av");
       if (chip.picture) {
         const img = el("img");
@@ -1151,6 +1180,19 @@ class ElvioRoomCard extends HTMLElement {
     }
     if (cfg.type === "fuel") {
       this._updateFuel(tile);
+      return;
+    }
+    if (cfg.type === "setup") {
+      tile.name.textContent = cfg.name || "Einrichtung";
+      if (!(hass.user && hass.user.is_admin)) {
+        tile.state.textContent = "Nur mit Admin-Anmeldung";
+        return;
+      }
+      this._ensureSetup();
+      const open = setupCache ? setupCache.items.filter((i) => !i.done).length : null;
+      tile.state.textContent =
+        this._setupError ? "Prüfung fehlgeschlagen" : open == null ? "Wird geprüft …" : open ? `${open} offen` : "Alles eingerichtet";
+      tile.node.classList.toggle("on", !!open);
       return;
     }
     if (cfg.type === "automations") {
@@ -1643,6 +1685,435 @@ class ElvioRoomCard extends HTMLElement {
     this._editWrap.hidden = true;
     this._confirmPath = path;
     this._confirmWrap.hidden = false;
+  }
+
+  // ───────────── Einrichtung ─────────────
+
+  _dashPath() {
+    return location.pathname.split("/")[1] || "lovelace";
+  }
+
+  _ensureSetup() {
+    if (setupCache || setupRunning || this._setupError) return;
+    this._setupState().then(
+      () => this._afterSetupCheck(),
+      () => this._afterSetupCheck(),
+    );
+  }
+
+  _afterSetupCheck() {
+    this._chipsKey = "";
+    if (this._built) this._update();
+  }
+
+  async _setupState(force = false) {
+    const dash = this._dashPath();
+    if (!force && setupCache && setupCache.dash === dash && Date.now() - setupCache.at < SETUP_TTL_MS) return setupCache.items;
+    if (setupRunning) return setupRunning;
+    setupRunning = this._collectSetup(dash)
+      .then((items) => {
+        setupCache = { at: Date.now(), dash, items };
+        this._setupError = null;
+        return items;
+      })
+      .catch((err) => {
+        this._setupError = setupErrText(err);
+        throw err;
+      })
+      .finally(() => {
+        setupRunning = null;
+      });
+    return setupRunning;
+  }
+
+  async _collectSetup(dash) {
+    const hass = this._hass;
+    const ws = (msg) => hass.callWS(msg);
+    const comps = hass.config.components || [];
+    const urlPath = dash === "lovelace" ? null : dash;
+    const items = [];
+
+    let repos = null;
+    if (comps.includes("hacs")) repos = await ws({ type: "hacs/repositories/list" });
+    const repo = (name) => repos && repos.find((r) => String(r.full_name || "").toLowerCase() === name.toLowerCase());
+
+    const card = repo(SETUP_CARD_REPO);
+    if (card && card.installed_version) {
+      const current = card.installed_version === card.available_version;
+      items.push({
+        id: "card",
+        icon: "mdi:update",
+        name: "Raumkarte aktuell",
+        sub: current ? `Version ${card.installed_version}` : `${card.installed_version} → ${card.available_version}`,
+        done: current,
+        run: async (step) => {
+          step("Lade neue Version …");
+          await ws({ type: "hacs/repository/download", repository: card.id });
+          return "reload";
+        },
+      });
+    }
+
+    if (repos) {
+      const km = repo(SETUP_KIOSK_REPO);
+      const dashCfg = await ws({ type: "lovelace/config", url_path: urlPath });
+      const hidden = !!(dashCfg && dashCfg.kiosk_mode && dashCfg.kiosk_mode.hide_sidebar);
+      const installed = !!(km && km.installed_version);
+      items.push({
+        id: "kiosk",
+        icon: "mdi:fullscreen",
+        name: "Seitenleiste ausblenden",
+        sub: "Nur in diesem Dashboard (kiosk-mode). Bearbeiten mit ?disable_km an der Adresse.",
+        done: installed && hidden,
+        run: async (step) => {
+          if (!installed) {
+            if (!km) throw new Error("kiosk-mode steht nicht im HACS-Katalog");
+            step("Installiere kiosk-mode …");
+            await ws({ type: "hacs/repository/download", repository: km.id });
+          }
+          if (!hidden) {
+            step("Stelle das Dashboard um …");
+            const c = await ws({ type: "lovelace/config", url_path: urlPath });
+            c.kiosk_mode = { ...(c.kiosk_mode || {}), hide_sidebar: true, hide_header: true };
+            await ws({ type: "lovelace/config/save", url_path: urlPath, config: c });
+          }
+          return "reload";
+        },
+      });
+    }
+
+    // Systemweite Startseite gibt es erst in neueren Versionen; fehlt der Befehl, entfällt der Punkt.
+    let sys = null;
+    try {
+      sys = await ws({ type: "frontend/get_system_data", key: "core" });
+    } catch (err) {
+      if (!(err && err.code === "unknown_command")) throw err;
+    }
+    if (sys) {
+      const cur = sys.value && sys.value.default_panel;
+      items.push({
+        id: "start",
+        icon: "mdi:home-import-outline",
+        name: "Startseite für alle",
+        sub: cur === dash ? "Die App öffnet mit diesem Dashboard" : "Die App soll mit diesem Dashboard öffnen",
+        done: cur === dash,
+        run: async () => {
+          const now = await ws({ type: "frontend/get_system_data", key: "core" });
+          await ws({ type: "frontend/set_system_data", key: "core", value: { ...((now && now.value) || {}), default_panel: dash } });
+        },
+      });
+    }
+
+    if (comps.includes("hassio")) {
+      const sup = (endpoint, method = "get", data) => ws({ type: "supervisor/api", endpoint, method, data, timeout: null });
+      // Unbekanntes Add-on (Store ohne MA-Repository) wirft – das heißt schlicht „nicht installiert“.
+      const info = await sup(`/addons/${SETUP_MA_SLUG}/info`).catch(() => null);
+      const installed = !!(info && info.version);
+      const started = installed && info.state === "started";
+      const linked = comps.includes("music_assistant");
+      items.push({
+        id: "music",
+        icon: "mdi:music-box-multiple-outline",
+        name: "Music Assistant",
+        sub: !installed
+          ? "Musik auf allen Lautsprechern, Spotify & Co."
+          : !started
+            ? "Installiert, läuft aber nicht"
+            : !linked
+              ? "Läuft, ist aber nicht mit Home Assistant verbunden"
+              : !info.ingress_panel
+                ? "Läuft; Knopf „Musikdienste“ braucht den Eintrag in der Seitenleiste"
+                : "Läuft und ist verbunden",
+        done: started && linked && !!info.ingress_panel,
+        run: async (step) => {
+          if (!installed) {
+            const store = await sup("/store/repositories");
+            if (!(store || []).some((r) => r.source === SETUP_MA_STORE)) {
+              step("Füge die Add-on-Quelle hinzu …");
+              await sup("/store/repositories", "post", { repository: SETUP_MA_STORE });
+            }
+            step("Installiere Music Assistant … (einige Minuten)");
+            await sup(`/store/addons/${SETUP_MA_SLUG}/install`, "post");
+          }
+          const now = await sup(`/addons/${SETUP_MA_SLUG}/info`);
+          if (!now.ingress_panel) await sup(`/addons/${SETUP_MA_SLUG}/options`, "post", { ingress_panel: true });
+          if (now.state !== "started") {
+            step("Starte Music Assistant …");
+            await sup(`/addons/${SETUP_MA_SLUG}/start`, "post");
+          }
+          if (!(hass.config.components || []).includes("music_assistant")) {
+            step("Verbinde mit Home Assistant …");
+            // Das Add-on meldet sich selbst an; die Meldung muss nur bestätigt werden.
+            let flow = null;
+            for (let i = 0; i < 30 && !flow; i++) {
+              const flows = await ws({ type: "config_entries/flow/progress" });
+              flow = flows.find((f) => f.handler === "music_assistant");
+              if (!flow) await new Promise((r) => setTimeout(r, 3000));
+            }
+            if (!flow) throw new Error("Music Assistant läuft, hat sich aber nicht bei Home Assistant gemeldet. Unter Geräte & Dienste nachsehen.");
+            const res = await hass.callApi("POST", `config/config_entries/flow/${flow.flow_id}`, {});
+            if (res.type !== "create_entry") throw new Error(`Verbinden nicht abgeschlossen (${res.type}${res.reason ? ": " + res.reason : ""})`);
+          }
+          return "reload";
+        },
+      });
+    }
+
+    const stations = this._fuelStations();
+    if (stations.length) {
+      const have = Object.values(hass.states).some(
+        (st) => st.entity_id.startsWith("automation.") && /^tanken_.+_guenstig$/.test(String(st.attributes.id || "")),
+      );
+      items.push({
+        id: "fuel",
+        icon: "mdi:gas-station-outline",
+        name: "Push: günstig tanken",
+        sub: have ? "Eingerichtet" : `${stations.length} Tankstellen gefunden – Meldung, wenn der Preis deutlich unter dem Wochenschnitt liegt`,
+        done: have,
+        form: true,
+      });
+    }
+    return items;
+  }
+
+  // Tankerkönig legt je Tankstelle ein Gerät mit Preis-Sensoren an (…_super, …_super_e10, …_diesel).
+  _fuelStations() {
+    const hass = this._hass;
+    const byDevice = new Map();
+    for (const e of Object.values(hass.entities || {})) {
+      if (e.platform !== "tankerkoenig" || !e.entity_id.startsWith("sensor.") || !e.device_id) continue;
+      const kind = /_super_e10$/.test(e.entity_id) ? "e10" : /_super$/.test(e.entity_id) ? "e5" : /_diesel$/.test(e.entity_id) ? "diesel" : null;
+      if (!kind) continue;
+      const dev = (hass.devices || {})[e.device_id] || {};
+      const st = byDevice.get(e.device_id) || { name: dev.name_by_user || dev.name || e.device_id };
+      st[kind] = e.entity_id;
+      byDevice.set(e.device_id, st);
+    }
+    return [...byDevice.values()];
+  }
+
+  _openSetup() {
+    this._editMode = "setup";
+    this._editWrap.hidden = false;
+    this._editMsg.hidden = true;
+    this._editTitle.textContent = "Einrichtung";
+    this._renderSetup();
+    if (this._hass.user && this._hass.user.is_admin) {
+      this._setupState(true).then(
+        () => this._renderSetup(),
+        () => this._renderSetup(),
+      );
+    }
+  }
+
+  _renderSetup() {
+    if (this._editMode !== "setup" || this._editWrap.hidden) return;
+    const isAdmin = !!(this._hass.user && this._hass.user.is_admin);
+    this._editHint.textContent = isAdmin
+      ? "Funktionen, die zur Raumkarte gehören. Jeder Schritt läuft nur, wenn du ihn antippst."
+      : "Einrichten geht nur mit Admin-Anmeldung.";
+    this._editActions.replaceChildren();
+    const list = this._editList;
+    list.innerHTML = "";
+    if (!isAdmin) return;
+    const again = el("button", "stextbtn", "Neu prüfen");
+    again.addEventListener("click", () => this._openSetup());
+    this._editActions.appendChild(again);
+    if (this._setupError) {
+      this._editMsg.textContent = `Prüfung fehlgeschlagen: ${this._setupError}`;
+      this._editMsg.hidden = false;
+    }
+    if (!setupCache) {
+      list.appendChild(el("div", "ag-empty", "Wird geprüft …"));
+      return;
+    }
+    for (const item of setupCache.items) {
+      const row = el("div", "erow");
+      const ic = el("div", "eicon");
+      ic.appendChild(icon(item.icon));
+      const txt = el("div", "etext");
+      txt.append(el("div", "sname", item.name), el("div", "ssub", item.sub || ""));
+      row.append(ic, txt);
+      if (item.done) {
+        const ok = el("div", "sdone");
+        ok.appendChild(icon("mdi:check-circle"));
+        row.appendChild(ok);
+      } else {
+        const b = el("button", "stextbtn", "Einrichten");
+        b.addEventListener("click", () => (item.form ? this._renderFuelSetup() : this._runSetup(item, b, txt)));
+        row.appendChild(b);
+      }
+      list.appendChild(row);
+    }
+    if (!setupCache.items.length) list.appendChild(el("div", "ag-empty", "Hier gibt es nichts einzurichten."));
+  }
+
+  async _runSetup(item, button, txt) {
+    this._editMsg.hidden = true;
+    button.disabled = true;
+    const sub = txt.querySelector(".ssub");
+    const step = (msg) => {
+      button.textContent = "Läuft …";
+      sub.textContent = msg;
+    };
+    step("Starte …");
+    try {
+      const res = await item.run(step);
+      setupCache = null;
+      if (res === "reload") {
+        sub.textContent = "Fertig – die Seite lädt neu.";
+        setTimeout(() => location.reload(), 1500);
+        return;
+      }
+      await this._setupState(true);
+      this._renderSetup();
+      this._afterSetupCheck();
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = "Einrichten";
+      sub.textContent = item.sub || "";
+      this._editMsg.textContent = `${item.name}: ${setupErrText(err)}`;
+      this._editMsg.hidden = false;
+    }
+  }
+
+  _renderFuelSetup() {
+    const hass = this._hass;
+    this._editTitle.textContent = "Push: günstig tanken";
+    this._editHint.textContent =
+      "Meldung aufs Handy, wenn der günstigste Preis der Tankstellen mindestens 3 ct unter dem Schnitt der letzten 7 Tage liegt – höchstens einmal am Tag, 6–21 Uhr. Die erste kommt frühestens nach 2 Tagen.";
+    this._editMsg.hidden = true;
+    const list = this._editList;
+    list.innerHTML = "";
+    const chosen = { kinds: new Set(), targets: new Set() };
+    const toggleRow = (label, sub, set, key) => {
+      const row = el("div", "erow");
+      const txt = el("div", "etext");
+      txt.append(el("div", "sname", label), el("div", "ssub", sub || ""));
+      const sw = el("button", "lswitch");
+      sw.addEventListener("click", () => {
+        if (set.has(key)) set.delete(key);
+        else set.add(key);
+        sw.classList.toggle("on", set.has(key));
+      });
+      row.append(txt, sw);
+      list.appendChild(row);
+    };
+    const stations = this._fuelStations();
+    list.appendChild(el("div", "esub", "Sorte"));
+    for (const k of FUEL_KINDS) {
+      if (stations.some((st) => st[k.key])) toggleRow(k.label, "", chosen.kinds, k.key);
+    }
+    list.appendChild(el("div", "esub", "Empfänger"));
+    const targets = Object.keys((hass.services && hass.services.notify) || {}).filter((n) => n.startsWith("mobile_app_"));
+    const devName = (svc) => {
+      const slug = svc.replace(/^mobile_app_/, "");
+      const dev = Object.values(hass.devices || {}).find(
+        (d) => String(d.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") === slug,
+      );
+      return dev ? dev.name_by_user || dev.name : slug;
+    };
+    for (const t of targets) toggleRow(devName(t), t, chosen.targets, t);
+    if (!targets.length) list.appendChild(el("div", "ag-empty", "Kein Handy mit der Home-Assistant-App gefunden."));
+    this._editActions.replaceChildren();
+    const back = el("button", "stextbtn emove", "Zurück");
+    back.addEventListener("click", () => this._openSetup());
+    const go = el("button", "stextbtn", "Anlegen");
+    go.addEventListener("click", async () => {
+      if (!chosen.kinds.size || !chosen.targets.size) {
+        this._editMsg.textContent = "Bitte mindestens eine Sorte und einen Empfänger wählen.";
+        this._editMsg.hidden = false;
+        return;
+      }
+      this._editMsg.hidden = true;
+      go.disabled = true;
+      go.textContent = "Lege an …";
+      try {
+        await this._createFuelPush(stations, [...chosen.kinds], [...chosen.targets]);
+        setupCache = null;
+        this._openSetup();
+      } catch (err) {
+        go.disabled = false;
+        go.textContent = "Anlegen";
+        this._editMsg.textContent = `Nicht angelegt: ${setupErrText(err)}`;
+        this._editMsg.hidden = false;
+      }
+    });
+    this._editActions.append(back, go);
+  }
+
+  async _createFuelPush(stations, kinds, targets) {
+    const hass = this._hass;
+    const flow = async (handler, steps) => {
+      let f = await hass.callApi("POST", "config/config_entries/flow", { handler });
+      for (const data of steps) {
+        if (f.type === "create_entry") break;
+        f = await hass.callApi("POST", `config/config_entries/flow/${f.flow_id}`, data);
+        if (f.errors && Object.keys(f.errors).length) throw new Error(`${handler}: ${JSON.stringify(f.errors)}`);
+      }
+      if (f.type !== "create_entry") throw new Error(`${handler}: nicht abgeschlossen (${f.type})`);
+      const reg = await hass.callWS({ type: "config/entity_registry/list" });
+      const ent = reg.find((e) => e.config_entry_id === f.result.entry_id);
+      if (!ent) throw new Error(`${handler}: Sensor nicht gefunden`);
+      return ent.entity_id;
+    };
+    for (const kind of kinds) {
+      const label = (FUEL_KINDS.find((k) => k.key === kind) || {}).label || kind;
+      const ids = stations.filter((st) => st[kind]);
+      const list = ids.map((st) => `states('${st[kind]}')|float(none)`).join(", ");
+      const cheap = await flow("template", [
+        { next_step_id: "sensor" },
+        {
+          name: `Günstigster ${label}`,
+          state: `{% set p = [${list}] | reject('none') | list %}{{ (p | min) if p | count > 0 else none }}`,
+          unit_of_measurement: "€/L",
+        },
+      ]);
+      const mean = await flow("statistics", [
+        { name: `${label} Mittel 7 Tage`, entity_id: cheap },
+        { state_characteristic: "mean" },
+        { max_age: { days: 7, hours: 0, minutes: 0, seconds: 0 }, precision: 3, keep_last_sample: true },
+      ]);
+      const names = "{" + ids.map((st) => `'${st[kind]}': ${JSON.stringify(st.name)}`).join(", ") + "}";
+      const id = `tanken_${kind}_guenstig`;
+      await hass.callApi("POST", `config/automation/config/${id}`, {
+        id,
+        alias: `Tanken: ${label} günstig`,
+        description: `Push, wenn ${label} mindestens 3 ct unter dem 7-Tage-Schnitt des günstigsten Preises liegt. Höchstens einmal am Tag, 6–21 Uhr, erst ab 2 Tagen Verlauf.`,
+        mode: "single",
+        triggers: [{ trigger: "state", entity_id: cheap }],
+        conditions: [
+          { condition: "time", after: "06:00:00", before: "21:00:00" },
+          { condition: "template", value_template: `{{ (state_attr('${mean}','age_coverage_ratio') or 0) >= 0.3 }}` },
+          {
+            condition: "template",
+            value_template: `{% set p = states('${cheap}')|float(none) %}{% set m = states('${mean}')|float(none) %}{{ p is not none and m is not none and p <= m - 0.03 }}`,
+          },
+          {
+            condition: "template",
+            value_template: "{% set l = this.attributes.last_triggered %}{{ l is none or as_local(l).date() < now().date() }}",
+          },
+        ],
+        actions: [
+          {
+            variables: {
+              preis: `{{ states('${cheap}')|float }}`,
+              schnitt: `{{ states('${mean}')|float }}`,
+              tankstelle: `{% set m = ${names} %}{% set ns = namespace(n='') %}{% for e, n in m.items() %}{% if states(e)|float(99) == states('${cheap}')|float %}{% set ns.n = ns.n ~ (', ' if ns.n else '') ~ n %}{% endif %}{% endfor %}{{ ns.n }}`,
+            },
+          },
+          ...targets.map((t) => ({
+            action: `notify.${t}`,
+            continue_on_error: true,
+            data: {
+              title: `${label} günstig`,
+              message: "{{ '%.3f'|format(preis)|replace('.',',') }} € bei {{ tankstelle }} – {{ ((schnitt - preis) * 100)|round(0)|int }} ct unter dem 7-Tage-Schnitt.",
+              data: { url: `/${this._dashPath()}`, group: "tanken" },
+            },
+          })),
+        ],
+      });
+    }
   }
 
   // ───────────── Raum des Tablets & Musik je Raum ─────────────
@@ -3706,6 +4177,7 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .lswitch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%;
   background: #fff; transition: transform .2s; }
 .lswitch.on { background: #f5b450; }
+.sdone { flex: none; color: #9be08a; --mdc-icon-size: 24px; }
 .lswitch.on::after { transform: translateX(20px); }
 .smore { align-self: center; margin: 8px 0 4px; height: 40px; padding: 0 18px; border-radius: 999px;
   background: rgba(255,255,255,.12); font-size: 13px; }
