@@ -40,6 +40,14 @@ const SEARCH_LIMIT = 12;
 const LIBRARY_PAGE = 40;
 // Termine: neu laden alle 5 Minuten oder sobald sich ein Kalender ändert.
 const AGENDA_REFRESH_MS = 5 * 60 * 1000;
+// Spritpreise ändern sich über den Tag mehrfach; der Verlauf fürs Minidiagramm wird
+// nicht bei jedem Zustandswechsel, sondern in diesem Takt neu geholt.
+const FUEL_REFRESH_MS = 15 * 60 * 1000;
+const FUEL_KINDS = [
+  { key: "e5", label: "Super E5" },
+  { key: "e10", label: "E10" },
+  { key: "diesel", label: "Diesel" },
+];
 // Bildschirmschoner: Fotowechsel und Prüftakt für „untätig“.
 const SAVER_PHOTO_MS = 20000;
 const SAVER_CHECK_MS = 5000;
@@ -130,10 +138,13 @@ class ElvioRoomCard extends HTMLElement {
       if (tile.type === "energy" && !tile.solar) {
         throw new Error(`Energie-Kachel braucht solar: ${JSON.stringify(tile)}`);
       }
+      if (tile.type === "fuel" && (!Array.isArray(tile.stations) || !tile.stations.length)) {
+        throw new Error(`Tank-Kachel braucht stations: ${JSON.stringify(tile)}`);
+      }
       if (tile.type === "automations" && !Array.isArray(tile.templates)) {
         throw new Error(`Automationen-Kachel braucht templates: ${JSON.stringify(tile)}`);
       }
-      if (!["lights", "service", "account", "now_playing", "search", "agenda", "energy", "tablet_room", "automations"].includes(tile.type) && !tile.entity) {
+      if (!["lights", "service", "account", "now_playing", "search", "agenda", "energy", "tablet_room", "automations", "fuel"].includes(tile.type) && !tile.entity) {
         throw new Error(`Kachel ohne Entität: ${JSON.stringify(tile)}`);
       }
       if (tile.type === "service" && !tile.path && !tile.config_flow && !tile.url) {
@@ -585,6 +596,7 @@ class ElvioRoomCard extends HTMLElement {
   }
 
   _span(cfg) {
+    if (cfg.type === "fuel") return cfg.span || 4;
     return cfg.span || (["now_playing", "tv", "agenda", "energy"].includes(cfg.type) ? 2 : 1);
   }
 
@@ -813,6 +825,33 @@ class ElvioRoomCard extends HTMLElement {
         node.append(head, tile.list);
         tile.fetched = 0;
         tile.calKey = "";
+        break;
+      }
+      case "fuel": {
+        // Spritpreise: Filter nach Sorte, je Tankstelle Preis und Verlauf als Minidiagramm,
+        // günstigste zuerst.
+        node.innerHTML = "";
+        const head = el("div", "fu-head");
+        head.append(el("div", "name", cfg.name || "Spritpreise"));
+        const chips = el("div", "fu-filter");
+        tile.kinds = FUEL_KINDS.filter((k) => cfg.stations.some((st) => st[k.key]));
+        tile.kind = (tile.kinds.find((k) => k.key === cfg.default) || tile.kinds[0] || {}).key;
+        tile.kindButtons = tile.kinds.map((k) => {
+          const b = el("button", "fu-chip", k.label);
+          b.addEventListener("click", () => {
+            tile.kind = k.key;
+            tile.fuelKey = "";
+            this._updateFuel(tile);
+          });
+          chips.appendChild(b);
+          return { key: k.key, b };
+        });
+        head.appendChild(chips);
+        tile.list = el("div", "fu-list");
+        node.append(head, tile.list);
+        tile.fetched = 0;
+        tile.history = {};
+        tile.fuelKey = "";
         break;
       }
       case "energy": {
@@ -1108,6 +1147,10 @@ class ElvioRoomCard extends HTMLElement {
     }
     if (cfg.type === "energy") {
       this._updateEnergy(tile);
+      return;
+    }
+    if (cfg.type === "fuel") {
+      this._updateFuel(tile);
       return;
     }
     if (cfg.type === "automations") {
@@ -1899,6 +1942,112 @@ class ElvioRoomCard extends HTMLElement {
       row.append(dot, when, what);
       tile.list.appendChild(row);
     }
+  }
+
+  // ───────────── Spritpreise ─────────────
+
+  _updateFuel(tile) {
+    if (!tile.loading && Date.now() - tile.fetched > FUEL_REFRESH_MS) this._fetchFuel(tile);
+    const ids = tile.cfg.stations.map((st) => st[tile.kind]).filter(Boolean);
+    // Nur neu zeichnen, wenn sich Sorte, ein Preis oder der Verlauf geändert hat – sonst
+    // baut jede fremde Zustandsänderung die Liste neu auf.
+    const key = [tile.kind, tile.fetched, ...ids.map((id) => (this._hass.states[id] || {}).state)].join("|");
+    if (key === tile.fuelKey) return;
+    tile.fuelKey = key;
+    this._renderFuel(tile);
+  }
+
+  async _fetchFuel(tile) {
+    const ids = tile.cfg.stations.flatMap((st) => FUEL_KINDS.map((k) => st[k.key]).filter(Boolean));
+    tile.loading = true;
+    try {
+      const hours = tile.cfg.hours || 48;
+      const res = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: new Date(Date.now() - hours * 3600000).toISOString(),
+        entity_ids: ids,
+        minimal_response: true,
+        no_attributes: true,
+        significant_changes_only: false,
+      });
+      const history = {};
+      for (const id of ids) {
+        history[id] = (res[id] || [])
+          .map((p) => ({ t: p.lu != null ? p.lu * 1000 : Date.parse(p.last_updated || p.last_changed), v: parseFloat(p.s) }))
+          .filter((p) => Number.isFinite(p.v) && Number.isFinite(p.t));
+      }
+      tile.history = history;
+      tile.historyError = null;
+    } catch (err) {
+      // Ohne Verlauf bleibt die Liste mit den aktuellen Preisen stehen; der Fehler steht
+      // sichtbar darunter, statt eine flache Linie vorzutäuschen.
+      tile.history = {};
+      tile.historyError = err.message || err.code || String(err);
+    } finally {
+      tile.fetched = Date.now();
+      tile.loading = false;
+      this._updateFuel(tile);
+    }
+  }
+
+  _renderFuel(tile) {
+    for (const { key, b } of tile.kindButtons) b.classList.toggle("active", key === tile.kind);
+    const rows = tile.cfg.stations
+      .map((st) => {
+        const id = st[tile.kind];
+        const s = id && this._hass.states[id];
+        const v = s ? parseFloat(s.state) : NaN;
+        return { name: st.name, id, v: Number.isFinite(v) ? v : null };
+      })
+      .filter((r) => r.id);
+    rows.sort((a, b) => (a.v == null) - (b.v == null) || (a.v ?? 0) - (b.v ?? 0));
+    const best = rows.find((r) => r.v != null);
+    const fmt = new Intl.NumberFormat("de-DE", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+    tile.list.innerHTML = "";
+    for (const r of rows) {
+      const row = el("button", "fu-row");
+      if (best && r.v != null && r.v === best.v) row.classList.add("best");
+      row.addEventListener("click", () => this._moreInfo(r.id));
+      row.appendChild(el("div", "fu-name", r.name || r.id));
+      row.appendChild(this._sparkline(tile.history[r.id] || [], r.v));
+      const price = el("div", "fu-price");
+      // Unbekannter Preis bleibt leer statt „0,000 €“.
+      price.textContent = r.v == null ? "–" : `${fmt.format(r.v)} €`;
+      if (best && r.v != null && r.v > best.v) {
+        price.appendChild(el("span", "fu-diff", `+${Math.round((r.v - best.v) * 100)} ct`));
+      }
+      row.appendChild(price);
+      tile.list.appendChild(row);
+    }
+    if (!rows.length) tile.list.appendChild(el("div", "ag-empty", "Keine Preise für diese Sorte"));
+    if (tile.historyError) tile.list.appendChild(el("div", "ag-empty", `Verlauf nicht ladbar: ${tile.historyError}`));
+  }
+
+  _sparkline(points, current) {
+    const W = 96;
+    const H = 26;
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    svg.setAttribute("class", "fu-spark");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    const pts = current == null ? points : [...points, { t: Date.now(), v: current }];
+    if (pts.length < 2) return svg;
+    const t0 = pts[0].t;
+    const t1 = pts[pts.length - 1].t || t0 + 1;
+    const vs = pts.map((p) => p.v);
+    const lo = Math.min(...vs);
+    const hi = Math.max(...vs);
+    const x = (t) => ((t - t0) / Math.max(1, t1 - t0)) * W;
+    const y = (v) => (hi === lo ? H / 2 : H - 2 - ((v - lo) / (hi - lo)) * (H - 4));
+    // Treppenlinie: ein Preis gilt, bis der nächste kommt.
+    let d = `M${x(pts[0].t).toFixed(1)},${y(pts[0].v).toFixed(1)}`;
+    for (let i = 1; i < pts.length; i++) {
+      d += ` H${x(pts[i].t).toFixed(1)} V${y(pts[i].v).toFixed(1)}`;
+    }
+    const path = document.createElementNS(ns, "path");
+    path.setAttribute("d", d);
+    svg.appendChild(path);
+    return svg;
   }
 
   // ───────────── Musiksuche (Music Assistant) ─────────────
@@ -3420,6 +3569,21 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .ag-sub { font-size: 12px; opacity: .65; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ag-sub:empty { display: none; }
 .ag-empty { font-size: 13px; opacity: .65; padding: 6px 0; }
+.tile.fuel { justify-content: flex-start; padding: 18px 20px 14px; cursor: default; }
+.fu-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.fu-filter { display: flex; gap: 6px; }
+.fu-chip { font: inherit; font-size: 13px; color: inherit; border: 0; border-radius: 999px; padding: 6px 12px; background: rgba(255,255,255,.12); cursor: pointer; }
+.fu-chip.active { background: rgba(255,255,255,.9); color: #1b1b1f; font-weight: 600; }
+.fu-list { display: flex; flex-direction: column; margin-top: 10px; }
+.fu-row { font: inherit; color: inherit; background: none; border: 0; text-align: left; cursor: pointer; display: grid; grid-template-columns: minmax(0, 1fr) 96px 104px; align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid rgba(255,255,255,.1); }
+.fu-row:first-child { border-top: 0; }
+.fu-name { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fu-spark { width: 96px; height: 26px; overflow: visible; }
+.fu-spark path { fill: none; stroke: currentColor; stroke-width: 1.6; opacity: .7; stroke-linejoin: round; }
+.fu-price { font-size: 15px; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; display: flex; flex-direction: column; align-items: flex-end; }
+.fu-diff { font-size: 11px; font-weight: 400; opacity: .6; }
+.fu-row.best .fu-name, .fu-row.best .fu-price { color: #9be08a; }
+.fu-row.best .fu-spark path { stroke: #9be08a; opacity: 1; }
 
 .saver { position: absolute; inset: 0; z-index: 30; background: #000; overflow: hidden; }
 .saver[hidden] { display: none; }
