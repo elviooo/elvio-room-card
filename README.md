@@ -14,6 +14,12 @@ Eine einzige JavaScript-Datei, keine weiteren Abhängigkeiten.
 HACS trägt die Ressource selbst ein. Ohne den Knopf: HACS → ⋮ → *Benutzerdefinierte
 Repositories* → `https://github.com/elviooo/elvio-room-card`, Typ **Dashboard**.
 
+## Mit einem KI-Assistenten einrichten
+
+Wer Claude (oder einen anderen Assistenten) mit Home-Assistant-Connector nutzt, gibt ihm
+[EINRICHTEN-MIT-CLAUDE.md](EINRICHTEN-MIT-CLAUDE.md). Er liest Räume und Geräte aus und baut
+das Dashboard daraus.
+
 ## Verwendung
 
 Die Karte ist für Ansichten im Panel-Modus gedacht (eine Karte füllt die ganze Fläche):
