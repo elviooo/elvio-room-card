@@ -390,6 +390,7 @@ class ElvioRoomCard extends HTMLElement {
     root.appendChild(el("style", "", STYLE));
 
     const frame = el("div", "frame");
+    frame.lang = "de"; // Silbentrennung für zweizeilige Namen („Bewegungs-licht“)
     this._bg = el("div", "bg");
     this._bgImg = el("img", "bg-img");
     this._bgImg.alt = "";
@@ -540,7 +541,7 @@ class ElvioRoomCard extends HTMLElement {
       tabbar.appendChild(b);
     }
 
-    frame.append(header, ...main, tabbar, this._buildPopup(), this._buildSearch(), this._buildRooms(), this._buildLights(), this._buildRoomsNav(), this._buildEdit(), this._buildConfirmHa());
+    frame.append(header, ...main, tabbar, this._buildPopup(), this._buildSearch(), this._buildRooms(), this._buildPlayer(), this._buildLights(), this._buildRoomsNav(), this._buildEdit(), this._buildConfirmHa());
     if (c.screensaver) {
       frame.appendChild(this._buildSaver());
       // Jede Berührung zählt als Aktivität. Ist der Schoner an, weckt der erste Tipp nur –
@@ -728,7 +729,14 @@ class ElvioRoomCard extends HTMLElement {
         node.append(ic, find, slider);
         tile.img = img;
         tile.slider = slider;
-        node.addEventListener("click", () => this._moreInfo(cfg.entity));
+        // Läuft etwas: HA-Dialog (Lautstärke, Quelle). Sonst Suche für diesen Raum – auf dem
+        // Handy ist die Lupe ausgeblendet, damit alle Kacheln dasselbe Muster haben.
+        node.addEventListener("click", () => {
+          const st = this._hass && this._hass.states[cfg.entity];
+          const active = st && ["playing", "paused", "buffering"].includes(st.state);
+          if (active) this._openMedia(cfg.entity);
+          else this._openSearch(this._areaId() || this._entityArea(this._hass.entities && this._hass.entities[cfg.entity]));
+        });
         break;
       }
       case "now_playing": {
@@ -781,7 +789,7 @@ class ElvioRoomCard extends HTMLElement {
         // Läuft etwas: HA-Dialog (Lautstärke, Quelle, Gruppieren). Sonst Suche – für den
         // gezeigten Raum, wenn die Karte einen hat.
         node.addEventListener("click", () => {
-          if (tile.entityId && tile.active) this._moreInfo(tile.entityId);
+          if (tile.entityId && tile.active) this._openMedia(tile.entityId);
           else this._openSearch(tile.areaId || this._areaId());
         });
         break;
@@ -1002,6 +1010,7 @@ class ElvioRoomCard extends HTMLElement {
     for (const tile of this._tiles) this._updateTile(tile);
     if (this._popupCard) this._popupCard.hass = hass;
     this._renderRooms();
+    this._renderPlayer();
     this._renderLights();
     this._renderRoomsNav();
   }
@@ -1115,7 +1124,7 @@ class ElvioRoomCard extends HTMLElement {
       // Quelle, Gruppieren, Sensor: Verlauf).
       const node = el("button", `chip ${chip.kind}`);
       node.addEventListener("click", () =>
-        chip.id === "offen" ? this._openOpenThings() : chip.id === "setup" ? this._openSetup() : this._moreInfo(chip.id),
+        chip.id === "offen" ? this._openOpenThings() : chip.id === "setup" ? this._openSetup() : this._openMedia(chip.id),
       );
       const av = el("div", "av");
       if (chip.picture) {
@@ -2272,7 +2281,7 @@ class ElvioRoomCard extends HTMLElement {
       txt.append(el("b", "", r.name), el("span", "", r.sub));
       node.append(av, txt);
       node.addEventListener("click", () =>
-        r.active ? this._moreInfo(r.entityId) : this._openSearch(r.areaId),
+        r.active ? this._openMedia(r.entityId) : this._openSearch(r.areaId),
       );
       this._roomChips.appendChild(node);
     }
@@ -2294,6 +2303,7 @@ class ElvioRoomCard extends HTMLElement {
   }
 
   _tickProgress() {
+    this._tickPlayer();
     if (!this._hass || !this._tiles) return;
     for (const tile of this._tiles) {
       if (tile.cfg.type !== "now_playing" || !tile.entityId) continue;
@@ -2321,21 +2331,37 @@ class ElvioRoomCard extends HTMLElement {
     } else {
       tile.art.removeAttribute("src");
     }
-    // App-Knöpfe nur neu bauen, wenn sich Liste oder aktive Quelle ändern (kein Flackern).
-    const apps = off ? [] : (tile.cfg.apps || a.source_list || []);
-    const key = JSON.stringify([apps, a.source]);
+    // App-Knöpfe auch im Aus-Zustand (viele Fernseher melden ihre Liste weiter): Tipp schaltet
+    // ein und startet die App. Nur neu bauen, wenn sich Liste oder Quelle ändern (kein Flackern).
+    const apps = tile.cfg.apps || a.source_list || [];
+    const key = JSON.stringify([apps, off ? null : a.source]);
     if (key === tile.appsKey) return;
     tile.appsKey = key;
     tile.apps.innerHTML = "";
     for (const app of apps) {
       const chip = el("button", "schip", app);
-      chip.classList.toggle("active", app === a.source);
+      chip.classList.toggle("active", !off && app === a.source);
       chip.addEventListener("click", (e) => {
         e.stopPropagation();
-        this._hass.callService("media_player", "select_source", { entity_id: tile.cfg.entity, source: app });
+        this._tvStart(tile.cfg.entity, app);
       });
       tile.apps.appendChild(chip);
     }
+  }
+
+  // Ist der Fernseher aus: erst einschalten, dann die App wählen, sobald er an ist (max. 20 s).
+  async _tvStart(entity, source) {
+    const isOff = () => {
+      const s = this._hass && this._hass.states[entity];
+      return !s || s.state === "off" || s.state === "standby" || s.state === "unavailable";
+    };
+    if (isOff()) {
+      await this._hass.callService("media_player", "turn_on", { entity_id: entity });
+      for (let i = 0; i < 40 && isOff(); i++) await new Promise((r) => setTimeout(r, 500));
+      if (isOff()) return;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    this._hass.callService("media_player", "select_source", { entity_id: entity, source });
   }
 
   // ───────────── Termine ─────────────
@@ -2954,6 +2980,201 @@ class ElvioRoomCard extends HTMLElement {
         el("div", "smuted", "Weitere Lautsprecher erscheinen hier, sobald sie in Music Assistant verbunden sind."),
       );
     }
+  }
+
+  // ───────────── Player (eigenes Fenster statt HA-Dialog) ─────────────
+
+  // Musik öffnet den eigenen Player; Fernseher und alles andere den HA-Dialog.
+  _openMedia(entityId) {
+    const st = this._hass && this._hass.states[entityId];
+    const isTv = st && st.attributes.device_class === "tv";
+    if (!st || isTv || !entityId.startsWith("media_player.")) return this._moreInfo(entityId);
+    this._openPlayer(entityId);
+  }
+
+  _buildPlayer() {
+    const wrap = el("div", "ssheet");
+    wrap.hidden = true;
+    const panel = el("div", "spanel ppanel");
+    const p = {};
+    p.room = el("div", "pl-room");
+    p.cover = el("img", "pl-cover");
+    p.cover.alt = "";
+    p.title = el("div", "pl-title");
+    p.artist = el("div", "pl-artist");
+    const meta = el("div", "pl-meta");
+    const metaText = el("div", "pl-metatext");
+    metaText.append(p.title, p.artist);
+    p.fav = el("button", "pl-fav");
+    p.fav.setAttribute("aria-label", "Zu Favoriten");
+    p.favIcon = icon("mdi:heart-outline");
+    p.fav.appendChild(p.favIcon);
+    p.fav.addEventListener("click", () => this._favoriteCurrent());
+    meta.append(metaText, p.fav);
+    // Fortschritt: antippen/ziehen springt an die Stelle (wenn der Player das kann).
+    p.seek = el("input", "slider pl-seek");
+    p.seek.type = "range";
+    p.seek.min = "0";
+    p.seek.max = "1000";
+    p.seek.setAttribute("aria-label", "Position");
+    p.seek.addEventListener("pointerdown", () => (p.seeking = true));
+    p.seek.addEventListener("change", () => {
+      p.seeking = false;
+      const st = this._hass.states[this._playerId];
+      const dur = st && Number(st.attributes.media_duration);
+      if (dur) this._playerCall("media_seek", { seek_position: (Number(p.seek.value) / 1000) * dur });
+    });
+    const times = el("div", "pl-times");
+    p.elapsed = el("span", "", "");
+    p.duration = el("span", "", "");
+    times.append(p.elapsed, p.duration);
+    const ctr = el("div", "pl-controls");
+    const btn = (name, label, fn, cls = "") => {
+      const b = el("button", cls);
+      b.setAttribute("aria-label", label);
+      const i = icon(name);
+      b.appendChild(i);
+      b.addEventListener("click", fn);
+      ctr.appendChild(b);
+      return { b, i };
+    };
+    p.shuffle = btn("mdi:shuffle-variant", "Zufall", () => {
+      const st = this._hass.states[this._playerId];
+      this._playerCall("shuffle_set", { shuffle: !(st && st.attributes.shuffle) });
+    }, "pl-mode");
+    btn("mdi:skip-previous", "Zurück", () => this._playerCall("media_previous_track"));
+    p.play = btn("mdi:play", "Wiedergabe/Pause", () => this._playerCall("media_play_pause"), "pl-play");
+    btn("mdi:skip-next", "Weiter", () => this._playerCall("media_next_track"));
+    p.repeat = btn("mdi:repeat", "Wiederholen", () => {
+      const st = this._hass.states[this._playerId];
+      const next = { off: "all", all: "one", one: "off" }[(st && st.attributes.repeat) || "off"];
+      this._playerCall("repeat_set", { repeat: next });
+    }, "pl-mode");
+    const volRow = el("div", "pl-vol");
+    p.vol = el("input", "slider");
+    p.vol.type = "range";
+    p.vol.min = "0";
+    p.vol.max = "100";
+    p.vol.setAttribute("aria-label", "Lautstärke");
+    p.vol.addEventListener("pointerdown", () => (p.dragging = true));
+    p.vol.addEventListener("change", () => {
+      p.dragging = false;
+      this._playerCall("volume_set", { volume_level: Number(p.vol.value) / 100 });
+    });
+    p.vol.addEventListener("input", () => p.vol.style.setProperty("--fill", `${p.vol.value}%`));
+    volRow.append(icon("mdi:volume-low"), p.vol, icon("mdi:volume-high"));
+    const actions = el("div", "pl-actions");
+    const rooms = el("button", "schip", "Räume");
+    rooms.addEventListener("click", () => this._openRooms(this._playerId));
+    const find = el("button", "schip", "Suchen");
+    find.addEventListener("click", () => {
+      const e = this._hass.entities && this._hass.entities[this._playerId];
+      this._openSearch(this._entityArea(e) || this._areaId());
+    });
+    actions.append(rooms, find);
+    p.toast = el("div", "pl-toast");
+    const body = el("div", "pl-body");
+    body.append(p.room, p.cover, meta, p.seek, times, ctr, volRow, actions, p.toast);
+    panel.append(body, this._backButton(() => (wrap.hidden = true)));
+    wrap.appendChild(panel);
+    wrap.addEventListener("click", (e) => {
+      if (e.target === wrap) wrap.hidden = true;
+    });
+    this._playerWrap = wrap;
+    this._pl = p;
+    return wrap;
+  }
+
+  _openPlayer(entityId) {
+    this._playerId = entityId;
+    this._pl.toast.textContent = "";
+    this._playerWrap.hidden = false;
+    this._renderPlayer(true);
+  }
+
+  _playerCall(service, data = {}) {
+    return this._hass.callService("media_player", service, { entity_id: this._playerId, ...data });
+  }
+
+  // Music Assistant legt je Player einen Knopf „Aktuellen Titel favorisieren“ an (gleiches Gerät).
+  // Den drücken wir – MA trägt den Titel dann auch beim Dienst ein (Spotify: Lieblingssongs).
+  _favoriteButton() {
+    const ents = (this._hass && this._hass.entities) || {};
+    const me = ents[this._playerId];
+    if (!me || !me.device_id) return null;
+    const hit = Object.values(ents).find(
+      (e) => e.device_id === me.device_id && e.entity_id.startsWith("button.") &&
+        /favorite|favori/i.test(`${e.translation_key || ""} ${e.entity_id}`),
+    );
+    return hit ? hit.entity_id : null;
+  }
+
+  async _favoriteCurrent() {
+    const p = this._pl;
+    const id = this._favoriteButton();
+    const st = this._hass.states[this._playerId];
+    if (!id || !st) return;
+    const key = `${st.attributes.media_title}|${st.attributes.media_artist}`;
+    try {
+      await this._hass.callService("button", "press", { entity_id: id });
+      this._favDone = this._favDone || new Set();
+      this._favDone.add(key);
+      p.toast.textContent = "Zu Favoriten hinzugefügt";
+      this._renderPlayer();
+    } catch (err) {
+      p.toast.textContent = `Hat nicht geklappt: ${err.message || err.code || err}`;
+    }
+  }
+
+  _renderPlayer(force) {
+    if (!this._playerWrap || (this._playerWrap.hidden && !force)) return;
+    const p = this._pl;
+    const st = this._hass.states[this._playerId];
+    if (!st) return;
+    const a = st.attributes;
+    p.room.textContent = this._playerLabel(st);
+    p.title.textContent = a.media_title || "Nichts läuft";
+    p.artist.textContent = [a.media_artist, a.media_album_name].filter(Boolean).join(" · ");
+    const pic = a.entity_picture;
+    if (pic) {
+      if (p.cover.getAttribute("src") !== pic) p.cover.src = pic;
+    } else p.cover.removeAttribute("src");
+    p.play.i.setAttribute("icon", st.state === "playing" ? "mdi:pause" : "mdi:play");
+    p.shuffle.b.classList.toggle("active", !!a.shuffle);
+    p.repeat.b.classList.toggle("active", !!a.repeat && a.repeat !== "off");
+    p.repeat.i.setAttribute("icon", a.repeat === "one" ? "mdi:repeat-once" : "mdi:repeat");
+    const favId = this._favoriteButton();
+    const key = `${a.media_title}|${a.media_artist}`;
+    const faved = !!(this._favDone && this._favDone.has(key));
+    p.fav.hidden = !favId || !a.media_title;
+    p.fav.classList.toggle("on", faved);
+    p.favIcon.setAttribute("icon", faved ? "mdi:heart" : "mdi:heart-outline");
+    p.vol.parentElement.hidden = a.volume_level == null;
+    if (!p.dragging && a.volume_level != null) p.vol.value = String(Math.round(a.volume_level * 100));
+    p.vol.style.setProperty("--fill", `${p.vol.value}%`);
+    this._tickPlayer();
+  }
+
+  _tickPlayer() {
+    if (!this._playerWrap || this._playerWrap.hidden) return;
+    const p = this._pl;
+    const st = this._hass.states[this._playerId];
+    if (!st) return;
+    const a = st.attributes;
+    const dur = Number(a.media_duration) || 0;
+    let pos = Number(a.media_position) || 0;
+    if (st.state === "playing" && a.media_position_updated_at) {
+      pos += (Date.now() - Date.parse(a.media_position_updated_at)) / 1000;
+    }
+    pos = Math.max(0, Math.min(pos, dur));
+    const fmt = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+    p.seek.hidden = !dur;
+    p.elapsed.parentElement.hidden = !dur;
+    if (!dur) return;
+    p.elapsed.textContent = fmt(pos);
+    p.duration.textContent = fmt(dur);
+    if (!p.seeking) p.seek.value = String(Math.round((pos / dur) * 1000));
+    p.seek.style.setProperty("--fill", `${(Number(p.seek.value) / 10).toFixed(1)}%`);
   }
 
   // ───────────── Dienste & Benutzer ─────────────
@@ -3865,7 +4086,10 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
   border-radius: inherit; border: 1px solid rgba(255,255,255,.22); }
 .tile:active { transform: scale(.985); }
 .text { position: relative; z-index: 1; }
-.name { font-size: 15px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Namen dürfen zwei Zeilen haben („Esstisch Ecke“ statt „Esstisch E…“), erst danach „…“. */
+.name { font-size: 15px; font-weight: 500; line-height: 1.25; overflow: hidden;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  -webkit-hyphens: auto; hyphens: auto; overflow-wrap: break-word; }
 .state { font-size: 12px; opacity: .72; margin-top: 3px; }
 .icon { position: absolute; right: 24px; top: 50%; transform: translateY(-50%); z-index: 1;
   --mdc-icon-size: 22px; opacity: .9; }
@@ -4207,6 +4431,36 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .ssheet:not([hidden]) .lrow {
   animation: riseIn .55s cubic-bezier(.2,.75,.25,1) backwards;
   animation-delay: calc(.06s + var(--i, 0) * 45ms); }
+/* Player: Cover, Titel mit Herz, Fortschritt, Steuerung, Lautstärke – mittig, eine Spalte. */
+.ppanel .pl-body { flex: 1; min-height: 0; width: min(440px, 100%); align-self: center; overflow-y: auto;
+  display: flex; flex-direction: column; align-items: center; gap: 14px; scrollbar-width: none; }
+.pl-room { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; opacity: .7; }
+.pl-cover { width: min(340px, 72vw, 40vh); aspect-ratio: 1; flex: none; border-radius: 22px; object-fit: cover;
+  background: rgba(255,255,255,.12); box-shadow: 0 24px 60px rgba(0,0,0,.45); }
+.pl-cover:not([src]) { visibility: hidden; }
+.pl-meta { width: 100%; display: flex; align-items: center; gap: 14px; margin-top: 6px; }
+.pl-metatext { flex: 1; min-width: 0; }
+.pl-title { font-size: 22px; font-weight: 700; letter-spacing: -.01em; line-height: 1.2; overflow: hidden;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.pl-artist { font-size: 15px; opacity: .7; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pl-fav { flex: none; width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center;
+  background: rgba(255,255,255,.12); --mdc-icon-size: 24px; }
+.pl-fav.on { background: rgba(255,255,255,.92); color: #e0245e; }
+.pl-fav[hidden] { display: none; }
+.ppanel .slider { position: static; width: 100%; }
+.pl-times { width: 100%; display: flex; justify-content: space-between; font-size: 12px; opacity: .7; margin-top: -10px;
+  font-variant-numeric: tabular-nums; }
+.pl-seek[hidden], .pl-times[hidden], .pl-vol[hidden] { display: none; }
+.pl-controls { width: 100%; display: flex; align-items: center; justify-content: space-between; }
+.pl-controls button { width: 50px; height: 50px; border-radius: 50%; display: grid; place-items: center; --mdc-icon-size: 30px; }
+.pl-controls .pl-play { width: 74px; height: 74px; background: rgba(255,255,255,.92); color: #1f1f1f; --mdc-icon-size: 36px; }
+.pl-controls .pl-mode { --mdc-icon-size: 22px; opacity: .5; }
+.pl-controls .pl-mode.active { opacity: 1; background: rgba(255,255,255,.16); }
+.pl-vol { width: 100%; display: flex; align-items: center; gap: 12px; --mdc-icon-size: 20px; }
+.pl-vol .slider { flex: 1; min-width: 0; }
+.pl-actions { display: flex; gap: 10px; }
+.pl-toast { min-height: 18px; font-size: 13px; opacity: .75; }
+
 @media (prefers-reduced-motion: reduce) {
   .frame *, .frame { animation: none !important; transition: none !important; }
   .section h2, .section .tile { opacity: 1; }
@@ -4244,11 +4498,13 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
   .np-controls .np-play { width: 42px; height: 42px; }
   .tile.tv { gap: 10px; padding: 14px 12px 12px 16px; }
   .tv-controls button { width: 34px; height: 34px; }
-  .tile { min-height: 116px; padding-left: 20px; }
-  /* Musik-Kachel: zwei Knöpfe passen nicht neben den Namen – Knöpfe oben, Text darunter. */
-  .tile.media { padding: 70px 20px 52px; }
-  .tile.media .icon { top: 16px; right: 14px; }
-  .tile.media .msearch { top: 16px; right: 56px; }
+  .tile { min-height: 124px; padding-left: 20px; }
+  /* Musik-Kachel wie die Licht-Kachel: Text oben links, ein Knopf oben rechts, Regler unten.
+     Die Lupe entfällt – ein Tipp auf die Kachel öffnet die Suche, solange nichts läuft. */
+  .tile.media { padding: 26px 60px 0 20px; }
+  .tile.media .icon { top: 20px; right: 14px; }
+  .tile.media .msearch { display: none; }
+  .tile.tv { min-height: 124px; }
   .en-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .en-value { font-size: 28px; }
   .tile.lights { padding-top: 26px; }

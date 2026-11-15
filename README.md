@@ -62,6 +62,22 @@ die eigene Installation angepasst werden.
 
 Weitere Kacheln lassen sich unter `sections` gruppieren (`title` + `tiles`).
 
+**Anordnung:** `now_playing`, `tv`, `agenda` und `energy` sind doppelt breit, `fuel` ganz breit.
+Auf dem Handy hat die Fläche zwei Spalten. Damit keine halben Reihen entstehen, schmale Kacheln
+paarweise vor die breiten setzen; bei ungerader Zahl der letzten schmalen `span: 2` geben.
+
+**Player:** Musik-Kachel, Live-Karte und Musik-Chips öffnen einen eigenen Player (Cover,
+Spulen, Zufall, Wiederholen, Lautstärke, Räume, Suche). Das Herz drückt den Knopf
+„Aktuellen Titel favorisieren“, den Music Assistant je Player anlegt – der Titel landet
+damit auch beim Dienst (Spotify: Lieblingssongs). Fernseher öffnen weiter den HA-Dialog.
+
+**Fernseher:** Die App-Knöpfe erscheinen auch im ausgeschalteten Zustand; ein Tipp schaltet ein
+und startet die App.
+
+**Ausstieg (`menu_path`):** immer auf ein normales Lovelace-Dashboard zeigen lassen, nicht auf
+`/home/overview`. kiosk-mode blendet die Seitenleiste sonst auch dort weiter aus, und unter iOS
+lässt sich das Menü nicht öffnen.
+
 ## Einrichtung auf Knopfdruck
 
 Manches gehört zur Karte, muss aber außerhalb installiert werden. Die Kachel `setup` (am
