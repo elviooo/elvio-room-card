@@ -33,12 +33,13 @@ const RING_FRESH_MS = 30000;
 const POPUP_AUTO_CLOSE_MS = 120000;
 const UNLOCK_CONFIRM_MS = 5000;
 // Gegensprechen über SIP Core (Klingel-Kachel mit sip_extension): Nach dem Annehmen sendet
-// die Karte diese Taste – die UniFi G3 Intercom schaltet das Gespräch erst danach frei.
-// Je Kachel änderbar mit sip_answer_dtmf ("" = keine Taste).
-const SIP_ANSWER_DTMF = "1";
+// die Karte auf Wunsch eine Taste (sip_answer_dtmf). Bewusst ohne Vorgabe: Bei vielen
+// Türstationen öffnet eine Taste das Schloss – ein Annehmen darf nie von selbst die Tür
+// öffnen. Bei UniFi Access öffnet „*“ (help.ui.com, Third-Party SIP); „*“ ist hier gesperrt.
 // Abstand zwischen bestätigtem Anruf und Taste: Asterisk soll beide Seiten schon verbunden haben.
 const SIP_DTMF_DELAY_MS = 600;
-// JsSIP nimmt Tasten erst an, wenn der Anruf bestätigt ist (ACK da). RTCSession.C.STATUS_CONFIRMED.
+// Die Karte sendet die Taste erst, wenn der Anruf bestätigt ist (ACK da,
+// RTCSession.C.STATUS_CONFIRMED) – strenger als JsSIP, das schon ab WAITING_FOR_ACK annimmt.
 const SIP_STATUS_CONFIRMED = 9;
 // Ab hier hängt die eigene Mikrofonspur an der Verbindung (RTCSession.C.STATUS_WAITING_FOR_ACK).
 // Vorher liefe Stummschalten ins Leere, und JsSIP holt es beim Anhängen nicht nach.
@@ -234,10 +235,14 @@ const sipBridge = {
       // Nur ankommende Anrufe. Selbst wählen (z. B. über SIP Core) bleibt Sache von SIP Core.
       if (session.direction !== "incoming") return;
       const ext = sc.remoteExtension;
-      const cfg = this._find(ext);
-      console.info(`elvio-room-card: Anruf von Nebenstelle ${ext}`, cfg ? "→ Klingel-Popup" : "(keine Klingel-Kachel mit dieser sip_extension)");
+      const { cfg, complete } = this._find(ext);
+      if (cfg || complete) {
+        console.info(`elvio-room-card: Anruf von Nebenstelle ${ext}`, cfg ? "→ Klingel-Popup" : "(keine Klingel-Kachel mit dieser sip_extension)");
+      }
       if (!cfg) {
-        this.ignored = session;
+        // Endgültig übergehen nur, wenn das Dashboard durchsucht werden konnte. Ist gerade
+        // keine Karte im Bild (z. B. HA-Einstellungen), sucht die nächste Karte erneut.
+        if (complete) this.ignored = session;
         return;
       }
       const call = { session, cfg, micOn: !cfg.sip_push_to_talk, ptt: false, dtmfDone: false, cause: null };
@@ -260,8 +265,9 @@ const sipBridge = {
 
   // Je Anruf frisch aus den Karten bzw. dem Dashboard (YAML kann sich geändert haben).
   // Was früher gefunden wurde, gilt nur, wenn das Dashboard gerade nicht lesbar ist.
+  // complete: Das Dashboard ließ sich durchsuchen – „nicht gefunden“ ist dann endgültig.
   _find(ext) {
-    if (ext == null) return null;
+    if (ext == null) return { cfg: null, complete: true };
     const key = String(ext);
     const found = new Map();
     for (const card of this.cards) {
@@ -277,26 +283,32 @@ const sipBridge = {
       }
     }
     for (const [k, t] of found) this.known.set(k, t);
-    if (found.has(key)) return found.get(key);
+    if (found.has(key)) return { cfg: found.get(key), complete: true };
     if (scanned) {
       this.known.delete(key);
-      return null;
+      return { cfg: null, complete: true };
     }
-    return this.known.get(key) || null;
+    return { cfg: this.known.get(key) || null, complete: false };
   },
 
   // Die laufende Karte behalten; sonst die mit der Kachel, sonst die zuletzt verbundene.
+  // Sichtbare Karten zuerst: HA blendet Karten mit Sichtbarkeits-Bedingung nur per
+  // display:none aus (hui-card), sie bleiben verbunden.
   _pick(cfg) {
     const live = [...this.cards].filter((c) => c.isConnected && c._built).reverse();
     if (this.host && live.includes(this.host)) return this.host;
+    const shown = live.filter((c) => typeof c.checkVisibility !== "function" || c.checkVisibility());
+    const pool = shown.length ? shown : live;
     const ext = String(cfg.sip_extension);
-    return live.find((c) => c._sipTiles().some((t) => String(t.sip_extension) === ext)) || live[0] || null;
+    return pool.find((c) => c._sipTiles().some((t) => String(t.sip_extension) === ext)) || pool[0] || null;
   },
 
+  // Nur mit sip_answer_dtmf. Ein Fehlschlag (z. B. Asterisk lehnt das INFO ab) meldet JsSIP
+  // nicht nach außen – die Konsole zeigt nur, dass gesendet wurde.
   _sendDtmf(call) {
     if (call.dtmfDone) return;
-    const tones = call.cfg.sip_answer_dtmf === undefined ? SIP_ANSWER_DTMF : call.cfg.sip_answer_dtmf;
-    if (tones === null || tones === false || String(tones) === "") {
+    const tones = call.cfg.sip_answer_dtmf;
+    if (tones == null || tones === false || String(tones) === "" || String(tones).includes("*")) {
       call.dtmfDone = true;
       return;
     }
@@ -307,6 +319,7 @@ const sipBridge = {
       if (this.call !== call) return;
       try {
         call.session.sendDTMF(String(tones), { transportType });
+        console.info(`elvio-room-card: Taste ${tones} an die Tür gesendet (${transportType})`);
       } catch (err) {
         console.warn("elvio-room-card: Taste an die Tür nicht gesendet", err);
       }
@@ -319,10 +332,14 @@ const sipBridge = {
     const status = call.session.status;
     if (status !== SIP_STATUS_WAITING_FOR_ACK && status !== SIP_STATUS_CONFIRMED) return;
     try {
-      const want = call.micOn || call.ptt;
       const muted = call.session.isMuted().audio;
+      // Hat jemand anderes umgeschaltet (z. B. das SIP-Core-Popup), gilt dessen Stand –
+      // sonst stellte das nächste Update (jede Sekunde) ihn wieder zurück.
+      if (call.applied !== undefined && muted === call.applied && !call.ptt) call.micOn = !muted;
+      const want = call.micOn || call.ptt;
       if (want && muted) call.session.unmute({ audio: true });
       else if (!want && !muted) call.session.mute({ audio: true });
+      call.applied = want;
     } catch (err) {
       console.warn("elvio-room-card: Mikro nicht umgeschaltet", err);
     }
@@ -401,6 +418,15 @@ class ElvioRoomCard extends HTMLElement {
       }
       if (tile.sip_dtmf_mode && !["info", "rfc2833"].includes(String(tile.sip_dtmf_mode).toLowerCase())) {
         throw new Error(`sip_dtmf_mode muss info oder rfc2833 sein: ${tile.sip_dtmf_mode}`);
+      }
+      if (tile.sip_answer_dtmf != null && tile.sip_answer_dtmf !== "") {
+        const tones = String(tile.sip_answer_dtmf);
+        if (tones.includes("*")) {
+          throw new Error("sip_answer_dtmf darf kein * enthalten – bei UniFi Access öffnet * die Tür");
+        }
+        if (!/^[0-9A-D#]+$/i.test(tones)) {
+          throw new Error(`sip_answer_dtmf: nur Ziffern, A–D und # erlaubt: ${tones}`);
+        }
       }
     }
     this._rawConfig = config;
@@ -4201,7 +4227,11 @@ class ElvioRoomCard extends HTMLElement {
   _sipRender(state) {
     const v = this._sipView;
     const name = v.call.cfg.name || "Klingel";
-    const phase = state === "connected" ? "talk" : state === "connecting" ? "connecting" : "ring";
+    // JsSIP zählt schon „angenommen“ (STATUS_ANSWERED, Mikrofonabfrage läuft noch) als
+    // verbunden. „Im Gespräch“ erst, wenn die eigene Spur dran und die Antwort raus ist.
+    const status = v.call.session.status;
+    const live = state === "connected" && (status === SIP_STATUS_WAITING_FOR_ACK || status === SIP_STATUS_CONFIRMED);
+    const phase = live ? "talk" : state === "incoming" ? "ring" : "connecting";
     if (phase === "ring") {
       this._popupTitle.textContent = "Es klingelt";
       this._popupSub.textContent = `${name} · ${this._clock ? this._clock.textContent : ""}`;
@@ -4217,6 +4247,8 @@ class ElvioRoomCard extends HTMLElement {
     if (phase !== v.phase) {
       v.phase = phase;
       this._sipActions();
+    } else if (phase === "talk") {
+      this._sipMicState();
     }
   }
 
@@ -4253,6 +4285,12 @@ class ElvioRoomCard extends HTMLElement {
         sipBridge.answer(call);
       });
       box.appendChild(accept);
+    } else if (v.phase === "connecting") {
+      // Platzhalter an der Stelle von „Annehmen“: ein zweiter Tipp landet hier und nicht
+      // auf dem Mikro-Knopf, der gleich an dieser Stelle erscheint.
+      const wait = button("accept", "mdi:phone", "Verbinde …");
+      wait.disabled = true;
+      box.appendChild(wait);
     } else if (v.phase === "talk") {
       if (call.cfg.sip_push_to_talk) {
         v.ptt = this._buildPtt(call);
@@ -4304,7 +4342,8 @@ class ElvioRoomCard extends HTMLElement {
     const noMic = call.cause === "User Denied Media Access";
     this._popup.classList.remove("rang", "talking");
     this._popupTitle.textContent = noMic ? "Kein Mikrofon" : v.phase === "talk" ? "Gespräch beendet" : "Anruf beendet";
-    this._popupSub.textContent = noMic ? "Mikrofon für Home Assistant im Browser freigeben" : call.cfg.name || "Klingel";
+    // JsSIP meldet jeden Mikrofon-Fehler so (verweigert, belegt, nicht vorhanden, kein HTTPS).
+    this._popupSub.textContent = noMic ? "Mikrofon nicht freigegeben, belegt oder nicht vorhanden" : call.cfg.name || "Klingel";
     this._popupActions.innerHTML = "";
     clearTimeout(this._sipEndTimer);
     this._sipEndTimer = setTimeout(() => this._closeDoorbell(), noMic ? SIP_ERROR_HOLD_MS : SIP_END_HOLD_MS);
