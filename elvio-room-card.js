@@ -4570,7 +4570,9 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .tile.ringing { background: rgba(255,255,255,.7); color: #262626; animation: ring 1.6s ease-in-out infinite; }
 @keyframes ring { 0%,100% { box-shadow: 0 0 0 0 rgba(255,255,255,.55); } 50% { box-shadow: 0 0 0 10px rgba(255,255,255,0); } }
 
-.popup { position: absolute; inset: 0; z-index: 10; display: grid; place-items: center;
+/* Über allen Fenstern (.ssheet: Suche, Räume, Player … z-index 10), unter dem Bildschirmschoner
+   (30, den das Klingeln ausblendet): Wer klingelt, verdrängt jedes offene Fenster. */
+.popup { position: absolute; inset: 0; z-index: 20; display: grid; place-items: center;
   padding: calc(24px + var(--sat)) 24px calc(24px + var(--sab));
   background: rgba(10,10,10,.45); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
 .popup[hidden] { display: none; }
