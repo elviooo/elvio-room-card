@@ -32,6 +32,20 @@ const RING_ACTIVE_MS = 60000;
 const RING_FRESH_MS = 30000;
 const POPUP_AUTO_CLOSE_MS = 120000;
 const UNLOCK_CONFIRM_MS = 5000;
+// Gegensprechen über SIP Core (Klingel-Kachel mit sip_extension): Nach dem Annehmen sendet
+// die Karte diese Taste – die UniFi G3 Intercom schaltet das Gespräch erst danach frei.
+// Je Kachel änderbar mit sip_answer_dtmf ("" = keine Taste).
+const SIP_ANSWER_DTMF = "1";
+// Abstand zwischen bestätigtem Anruf und Taste: Asterisk soll beide Seiten schon verbunden haben.
+const SIP_DTMF_DELAY_MS = 600;
+// JsSIP nimmt Tasten erst an, wenn der Anruf bestätigt ist (ACK da). RTCSession.C.STATUS_CONFIRMED.
+const SIP_STATUS_CONFIRMED = 9;
+// Ab hier hängt die eigene Mikrofonspur an der Verbindung (RTCSession.C.STATUS_WAITING_FOR_ACK).
+// Vorher liefe Stummschalten ins Leere, und JsSIP holt es beim Anhängen nicht nach.
+const SIP_STATUS_WAITING_FOR_ACK = 6;
+// Nach dem Auflegen bleibt der Hinweis so lange stehen, dann schließt das Popup.
+const SIP_END_HOLD_MS = 1800;
+const SIP_ERROR_HOLD_MS = 6000;
 // Fortschrittsbalken der Live-Karte läuft lokal weiter – HA meldet die Position nur bei
 // Sprüngen (Pause, Titelwechsel), nicht jede Sekunde.
 const PROGRESS_TICK_MS = 1000;
@@ -131,6 +145,222 @@ function setupErrText(err) {
   return (err && ((err.body && err.body.message) || err.message || err.code)) || String(err);
 }
 
+// ───────────── Gegensprechen über SIP Core ─────────────
+// SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
+// Änderung als Ereignis „sipcore-update“ am window. Benutzt werden nur: callState
+// (idle/incoming/outgoing/connecting/connected), RTCSession (JsSIP), remoteExtension,
+// callDuration, answerCall(), endCall(); Ton spielt SIP Core selbst ab (<audio id="remoteAudio">).
+//
+// Eine Steuerung für alle Ansichten: Das Tablet zeigt immer nur eine Raumansicht. Ruft die
+// Tür an, öffnet die gerade sichtbare Karte das Popup – auch wenn die Klingel-Kachel in einer
+// anderen Ansicht steht. Ohne SIP Core oder ohne sip_extension passiert hier nichts.
+
+// Klingel-Kacheln mit sip_extension aus einer Dashboard-Konfiguration (alle Ansichten).
+function collectSipTiles(node, out, depth = 0) {
+  if (!node || typeof node !== "object" || depth > 12) return;
+  if (Array.isArray(node)) {
+    for (const n of node) collectSipTiles(n, out, depth + 1);
+    return;
+  }
+  if (node.type === "custom:elvio-room-card") {
+    const tiles = [...(node.tiles || []), ...(node.sections || []).flatMap((s) => (s && s.tiles) || [])];
+    for (const t of tiles) {
+      if (t && t.type === "doorbell" && t.sip_extension != null && t.sip_extension !== "") {
+        out.set(String(t.sip_extension), t);
+      }
+    }
+    return;
+  }
+  for (const v of Object.values(node)) collectSipTiles(v, out, depth + 1);
+}
+
+const sipBridge = {
+  cards: new Set(),
+  host: null,
+  // Laufender Anruf an eine Klingel: { session, cfg, micOn, ptt, dtmfDone, cause }.
+  call: null,
+  // Anruf einer Nebenstelle ohne Klingel-Kachel: nicht bei jedem Update neu suchen.
+  ignored: null,
+  // Nebenstelle → Kachel, auch aus Ansichten, die gerade nicht zu sehen sind.
+  known: new Map(),
+  listening: false,
+
+  attach(card) {
+    if (!this.listening) {
+      this.listening = true;
+      const sync = () => this.sync();
+      for (const type of ["sipcore-update", "sipcore-call-started", "sipcore-call-ended"]) {
+        window.addEventListener(type, sync);
+      }
+    }
+    // Reihenfolge = zuletzt verbunden zuletzt: das ist die sichtbare Ansicht.
+    this.cards.delete(card);
+    this.cards.add(card);
+    this.later();
+  },
+
+  detach(card) {
+    this.cards.delete(card);
+    if (this.host === card) {
+      this.host = null;
+      this.later();
+    }
+  },
+
+  // Nach einem Ansichtswechsel erst prüfen, wenn die neue Karte steht.
+  later() {
+    clearTimeout(this._later);
+    this._later = setTimeout(() => this.sync(), 0);
+  },
+
+  sync() {
+    const sc = window.sipCore;
+    const session = (sc && sc.RTCSession) || null;
+    const state = session ? sc.callState : "idle";
+    if (!session) this.ignored = null;
+
+    const prev = this.call;
+    if (prev && (prev.session !== session || state === "idle")) {
+      this.call = null;
+      const host = this.host;
+      this.host = null;
+      // SIP Core meldet das Ende in seinem eigenen failed-Handler – unserer (mit dem Grund,
+      // z. B. Mikrofon verweigert) läuft erst danach. Darum einen Takt später anzeigen.
+      if (host) setTimeout(() => host._sipEnded(prev), 0);
+    }
+    if (!session || state === "idle" || session === this.ignored) return;
+
+    if (!this.call) {
+      // Nur ankommende Anrufe. Selbst wählen (z. B. über SIP Core) bleibt Sache von SIP Core.
+      if (session.direction !== "incoming") return;
+      const ext = sc.remoteExtension;
+      const cfg = this._find(ext);
+      console.info(`elvio-room-card: Anruf von Nebenstelle ${ext}`, cfg ? "→ Klingel-Popup" : "(keine Klingel-Kachel mit dieser sip_extension)");
+      if (!cfg) {
+        this.ignored = session;
+        return;
+      }
+      const call = { session, cfg, micOn: !cfg.sip_push_to_talk, ptt: false, dtmfDone: false, cause: null };
+      this.call = call;
+      session.on("failed", (e) => (call.cause = e && e.cause));
+      session.on("confirmed", () => this.sync());
+    }
+
+    const call = this.call;
+    if (state === "connected") {
+      this._applyMic(call);
+      this._sendDtmf(call);
+      this._kickAudio();
+    }
+    const host = this._pick(call.cfg);
+    if (this.host && this.host !== host) this.host._closeDoorbell();
+    this.host = host;
+    if (host) host._sipShow(call, state);
+  },
+
+  // Je Anruf frisch aus den Karten bzw. dem Dashboard (YAML kann sich geändert haben).
+  // Was früher gefunden wurde, gilt nur, wenn das Dashboard gerade nicht lesbar ist.
+  _find(ext) {
+    if (ext == null) return null;
+    const key = String(ext);
+    const found = new Map();
+    for (const card of this.cards) {
+      for (const t of card._sipTiles()) found.set(String(t.sip_extension), t);
+    }
+    let scanned = false;
+    if (!found.has(key)) {
+      for (const card of this.cards) {
+        const conf = card._dashboardConfig();
+        if (!conf) continue;
+        scanned = true;
+        collectSipTiles(conf, found);
+      }
+    }
+    for (const [k, t] of found) this.known.set(k, t);
+    if (found.has(key)) return found.get(key);
+    if (scanned) {
+      this.known.delete(key);
+      return null;
+    }
+    return this.known.get(key) || null;
+  },
+
+  // Die laufende Karte behalten; sonst die mit der Kachel, sonst die zuletzt verbundene.
+  _pick(cfg) {
+    const live = [...this.cards].filter((c) => c.isConnected && c._built).reverse();
+    if (this.host && live.includes(this.host)) return this.host;
+    const ext = String(cfg.sip_extension);
+    return live.find((c) => c._sipTiles().some((t) => String(t.sip_extension) === ext)) || live[0] || null;
+  },
+
+  _sendDtmf(call) {
+    if (call.dtmfDone) return;
+    const tones = call.cfg.sip_answer_dtmf === undefined ? SIP_ANSWER_DTMF : call.cfg.sip_answer_dtmf;
+    if (tones === null || tones === false || String(tones) === "") {
+      call.dtmfDone = true;
+      return;
+    }
+    if (call.session.status !== SIP_STATUS_CONFIRMED) return;
+    call.dtmfDone = true;
+    const transportType = String(call.cfg.sip_dtmf_mode || "info").toLowerCase() === "rfc2833" ? "RFC2833" : "INFO";
+    setTimeout(() => {
+      if (this.call !== call) return;
+      try {
+        call.session.sendDTMF(String(tones), { transportType });
+      } catch (err) {
+        console.warn("elvio-room-card: Taste an die Tür nicht gesendet", err);
+      }
+    }, SIP_DTMF_DELAY_MS);
+  },
+
+  // Mikro offen, wenn eingeschaltet oder Sprechtaste gedrückt. JsSIP schaltet dafür nur die
+  // eigene Tonspur stumm; das Gespräch bleibt bestehen.
+  _applyMic(call) {
+    const status = call.session.status;
+    if (status !== SIP_STATUS_WAITING_FOR_ACK && status !== SIP_STATUS_CONFIRMED) return;
+    try {
+      const want = call.micOn || call.ptt;
+      const muted = call.session.isMuted().audio;
+      if (want && muted) call.session.unmute({ audio: true });
+      else if (!want && !muted) call.session.mute({ audio: true });
+    } catch (err) {
+      console.warn("elvio-room-card: Mikro nicht umgeschaltet", err);
+    }
+  },
+
+  // SIP Core startet den Ton selbst. Hat der Browser das (Autoplay-Sperre) verweigert,
+  // erneut versuchen – nach dem Tipp auf „Annehmen“ ist es erlaubt.
+  _kickAudio() {
+    const a = document.getElementById("remoteAudio");
+    if (a && a.srcObject && a.paused) a.play().catch(() => {});
+  },
+
+  answer(call) {
+    if (this.call !== call || !window.sipCore) return;
+    this._kickAudio();
+    Promise.resolve(window.sipCore.answerCall()).catch((err) => console.warn("elvio-room-card: Annehmen fehlgeschlagen", err));
+  },
+
+  hangup(call) {
+    if (this.call !== call || !window.sipCore) return;
+    Promise.resolve(window.sipCore.endCall()).catch((err) => console.warn("elvio-room-card: Auflegen fehlgeschlagen", err));
+  },
+
+  toggleMic(call) {
+    if (this.call !== call) return;
+    call.micOn = !call.micOn;
+    this._applyMic(call);
+    if (this.host) this.host._sipMicState();
+  },
+
+  setPtt(call, on) {
+    if (this.call !== call || call.ptt === on) return;
+    call.ptt = on;
+    this._applyMic(call);
+    if (this.host) this.host._sipMicState();
+  },
+};
+
 class ElvioRoomCard extends HTMLElement {
   setConfig(config) {
     if (!config.title) throw new Error("title fehlt");
@@ -165,6 +395,12 @@ class ElvioRoomCard extends HTMLElement {
       }
       if (tile.unlock && !/^(button|input_button|lock)\./.test(tile.unlock)) {
         throw new Error(`unlock muss button.*, input_button.* oder lock.* sein: ${tile.unlock}`);
+      }
+      if (tile.sip_extension != null && tile.type !== "doorbell") {
+        throw new Error(`sip_extension gibt es nur bei der Klingel (type: doorbell): ${JSON.stringify(tile)}`);
+      }
+      if (tile.sip_dtmf_mode && !["info", "rfc2833"].includes(String(tile.sip_dtmf_mode).toLowerCase())) {
+        throw new Error(`sip_dtmf_mode muss info oder rfc2833 sein: ${tile.sip_dtmf_mode}`);
       }
     }
     this._rawConfig = config;
@@ -370,6 +606,7 @@ class ElvioRoomCard extends HTMLElement {
     this._progressTimer = setInterval(() => this._tickProgress(), PROGRESS_TICK_MS);
     this._saverTimer = setInterval(() => this._checkSaver(), SAVER_CHECK_MS);
     this._lastActive = Date.now();
+    sipBridge.attach(this);
   }
 
   disconnectedCallback() {
@@ -378,6 +615,8 @@ class ElvioRoomCard extends HTMLElement {
     clearInterval(this._progressTimer);
     clearInterval(this._saverTimer);
     clearInterval(this._saverPhotoTimer);
+    // Ein laufendes Gespräch geht weiter – die nächste sichtbare Karte übernimmt das Popup.
+    sipBridge.detach(this);
     this._closeDoorbell();
   }
 
@@ -567,6 +806,10 @@ class ElvioRoomCard extends HTMLElement {
     }
     root.appendChild(frame);
     this._built = true;
+    // Neu aufgebaut (auch mitten im Gespräch): Das Popup ist neu, ein laufender Anruf wird
+    // darin wieder angezeigt.
+    this._sipView = null;
+    sipBridge.later();
     this._updateClock();
 
     // Seitenwechsel: weich einblenden statt hart umschalten. Abschnitte unter dem ersten
@@ -685,6 +928,7 @@ class ElvioRoomCard extends HTMLElement {
       case "doorbell": {
         // Klingel: Ereignis-Entität (UniFi Protect/Access, Zustand = Zeitstempel des letzten
         // Klingelns). Antippen zeigt das Livebild, ohne dass jemand geklingelt hat.
+        // Mit sip_extension zusätzlich Gegensprechen über SIP Core (siehe sipBridge).
         const ic = el("div", "icon");
         ic.appendChild(icon(cfg.icon || "mdi:doorbell-video"));
         node.appendChild(ic);
@@ -3827,46 +4071,43 @@ class ElvioRoomCard extends HTMLElement {
     this._popupActions = el("div", "pactions");
     panel.append(head, this._popupVideo, this._popupActions);
     popup.appendChild(panel);
-    // Tipp neben das Fenster schließt es.
+    // Tipp neben das Fenster schließt es – nicht während eines Gesprächs (Fehlgriff).
     popup.addEventListener("click", (e) => {
-      if (e.target === popup) this._closeDoorbell();
+      if (e.target === popup && !this._sipView) this._closeDoorbell();
     });
     this._popup = popup;
+    this._popupCamFor = undefined;
     return popup;
   }
 
-  async _openDoorbell(cfg, rang) {
-    // Klingeln weckt das Tablet aus dem Bildschirmschoner.
+  // Klingeln weckt das Tablet aus dem Bildschirmschoner. Den Schoner beendet hier das
+  // Klingeln, nicht ein Tipp – also darf auch kein Tipp verschluckt werden, sonst ginge der
+  // erste Tipp auf „Annehmen“ bzw. „Tür öffnen“ ins Leere.
+  _wakeForDoorbell() {
     this._lastActive = Date.now();
-    if (this._saver && !this._saver.hidden) this._hideSaver();
+    if (this._saver && !this._saver.hidden) {
+      this._hideSaver();
+      this._swallowClick = false;
+    }
+  }
+
+  async _openDoorbell(cfg, rang) {
+    this._wakeForDoorbell();
+    // Läuft schon ein Gespräch über SIP, bleibt dessen Ansicht mit ihren Knöpfen stehen.
+    if (this._sipView) return;
     clearTimeout(this._popupTimer);
+    clearTimeout(this._sipEndTimer);
     this._popupTitle.textContent = rang ? "Es klingelt" : cfg.name || "Klingel";
     this._popupSub.textContent = rang
       ? `${cfg.name || "Klingel"} · ${this._clock ? this._clock.textContent : ""}`
       : "Livebild";
+    this._popup.classList.remove("sip", "talking");
     this._popup.classList.toggle("rang", rang);
     this._popup.hidden = false;
 
-    // Livebild über HAs eigene picture-entity-Karte: sie kann alle Stream-Arten
-    // (WebRTC, HLS, Standbild), die die Kamera-Integration liefert.
-    this._popupVideo.innerHTML = "";
-    this._popupCard = null;
-    if (cfg.camera) {
-      const helpers = await window.loadCardHelpers();
-      const card = helpers.createCardElement({
-        type: "picture-entity",
-        entity: cfg.camera,
-        camera_view: "live",
-        show_name: false,
-        show_state: false,
-        tap_action: { action: "none" },
-      });
-      card.hass = this._hass;
-      this._popupCard = card;
-      this._popupVideo.appendChild(card);
-    } else {
-      this._popupVideo.appendChild(el("div", "pnovideo", "Keine Kamera hinterlegt"));
-    }
+    await this._popupCamera(cfg, false);
+    // Inzwischen kam der Anruf über SIP: dessen Knöpfe gelten.
+    if (this._sipView) return;
 
     this._popupActions.innerHTML = "";
     if (cfg.unlock) this._popupActions.appendChild(this._buildUnlockButton(cfg.unlock));
@@ -3876,6 +4117,197 @@ class ElvioRoomCard extends HTMLElement {
 
     // Ein vergessenes Popup soll nicht stundenlang den Stream offen halten.
     this._popupTimer = setTimeout(() => this._closeDoorbell(), POPUP_AUTO_CLOSE_MS);
+  }
+
+  // Livebild über HAs eigene picture-entity-Karte: sie kann alle Stream-Arten
+  // (WebRTC, HLS, Standbild), die die Kamera-Integration liefert. reuse: läuft dieselbe
+  // Kamera schon, bleibt der Stream stehen (Klingeln → Anruf ohne Ruckeln).
+  async _popupCamera(cfg, reuse) {
+    const cam = cfg.camera || null;
+    if (reuse && this._popupCamFor === cam) return;
+    const token = (this._popupCamToken = (this._popupCamToken || 0) + 1);
+    this._popupCamFor = cam;
+    this._popupVideo.innerHTML = "";
+    this._popupCard = null;
+    if (!cam) {
+      this._popupVideo.appendChild(el("div", "pnovideo", "Keine Kamera hinterlegt"));
+      return;
+    }
+    const helpers = await window.loadCardHelpers();
+    // Inzwischen geschlossen oder eine andere Kamera gewählt.
+    if (token !== this._popupCamToken) return;
+    const card = helpers.createCardElement({
+      type: "picture-entity",
+      entity: cam,
+      camera_view: "live",
+      show_name: false,
+      show_state: false,
+      tap_action: { action: "none" },
+    });
+    card.hass = this._hass;
+    this._popupCard = card;
+    this._popupVideo.appendChild(card);
+  }
+
+  // ───────────── Gegensprechen (SIP) im Klingel-Popup ─────────────
+
+  // Klingel-Kacheln dieser Karte mit sip_extension (Rohkonfiguration: auch wenn die
+  // Klingel-Entität gerade ausgeblendet ist).
+  _sipTiles() {
+    const c = this._rawConfig || {};
+    return [...(c.tiles || []), ...(c.sections || []).flatMap((s) => (s && s.tiles) || [])].filter(
+      (t) => t && t.type === "doorbell" && t.sip_extension != null && t.sip_extension !== "",
+    );
+  }
+
+  // Konfiguration des ganzen Dashboards (alle Ansichten): von der Karte aufwärts bis zu
+  // dem Element, das sie hält (hui-view / hui-root haben `lovelace`).
+  _dashboardConfig() {
+    let node = this;
+    for (let i = 0; node && i < 60; i++) {
+      if (node.lovelace && node.lovelace.config) return node.lovelace.config;
+      node = node.parentNode || node.host;
+    }
+    return null;
+  }
+
+  // Anruf zeigen bzw. auf den neuen Stand bringen. state = callState von SIP Core.
+  _sipShow(call, state) {
+    if (!this._popup) return;
+    if (!this._sipView || this._sipView.call !== call) this._sipOpen(call);
+    this._sipRender(state);
+  }
+
+  _sipOpen(call) {
+    this._wakeForDoorbell();
+    // Ein Gespräch darf länger dauern als POPUP_AUTO_CLOSE_MS; es endet mit dem Auflegen.
+    clearTimeout(this._popupTimer);
+    clearTimeout(this._sipEndTimer);
+    const wasOpen = !this._popup.hidden;
+    this._popup.hidden = false;
+    this._popup.classList.add("sip");
+    this._popupCamera(call.cfg, wasOpen);
+    // Tür-öffnen-Knopf einmal je Anruf: Nachfrage und „Geöffnet“ überstehen den Wechsel
+    // von „Es klingelt“ zu „Im Gespräch“.
+    this._sipView = {
+      call,
+      phase: null,
+      unlock: call.cfg.unlock ? this._buildUnlockButton(call.cfg.unlock) : null,
+      mic: null,
+      ptt: null,
+    };
+  }
+
+  _sipRender(state) {
+    const v = this._sipView;
+    const name = v.call.cfg.name || "Klingel";
+    const phase = state === "connected" ? "talk" : state === "connecting" ? "connecting" : "ring";
+    if (phase === "ring") {
+      this._popupTitle.textContent = "Es klingelt";
+      this._popupSub.textContent = `${name} · ${this._clock ? this._clock.textContent : ""}`;
+    } else if (phase === "connecting") {
+      this._popupTitle.textContent = "Verbinde …";
+      this._popupSub.textContent = name;
+    } else {
+      this._popupTitle.textContent = "Im Gespräch";
+      this._popupSub.textContent = `${name} · ${window.sipCore ? window.sipCore.callDuration : ""}`;
+    }
+    this._popup.classList.toggle("rang", phase === "ring");
+    this._popup.classList.toggle("talking", phase === "talk");
+    if (phase !== v.phase) {
+      v.phase = phase;
+      this._sipActions();
+    }
+  }
+
+  // Knöpfe je Phase. Feste Plätze: Auflegen links, Tür öffnen in der Mitte, Annehmen bzw.
+  // Mikro rechts – ein doppelter Tipp auf „Annehmen“ trifft danach nicht „Auflegen“.
+  _sipActions() {
+    const v = this._sipView;
+    const call = v.call;
+    const box = this._popupActions;
+    box.innerHTML = "";
+    v.mic = null;
+    v.ptt = null;
+    const button = (cls, iconName, text) => {
+      const b = el("button", `pbtn ${cls}`);
+      b._icon = icon(iconName);
+      b._label = el("span", "", text);
+      b.append(b._icon, b._label);
+      return b;
+    };
+
+    const hangup = button("hangup", "mdi:phone-hangup", v.phase === "ring" ? "Ablehnen" : "Auflegen");
+    hangup.addEventListener("click", () => {
+      hangup.disabled = true;
+      sipBridge.hangup(call);
+    });
+    box.appendChild(hangup);
+    if (v.unlock) box.appendChild(v.unlock);
+
+    if (v.phase === "ring") {
+      const accept = button("accept", "mdi:phone", "Annehmen");
+      accept.addEventListener("click", () => {
+        accept.disabled = true;
+        accept._label.textContent = "Verbinde …";
+        sipBridge.answer(call);
+      });
+      box.appendChild(accept);
+    } else if (v.phase === "talk") {
+      if (call.cfg.sip_push_to_talk) {
+        v.ptt = this._buildPtt(call);
+        box.appendChild(v.ptt);
+      }
+      v.mic = button("mic", "mdi:microphone", "Mikro an");
+      v.mic.addEventListener("click", () => sipBridge.toggleMic(call));
+      box.appendChild(v.mic);
+      this._sipMicState();
+    }
+  }
+
+  // Gedrückt halten = sprechen. Pointer-Capture: Loslassen zählt auch neben dem Knopf.
+  _buildPtt(call) {
+    const b = el("button", "pbtn ptt");
+    b.append(icon("mdi:account-voice"), el("span", "", "Halten zum Sprechen"));
+    b.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      try {
+        b.setPointerCapture(e.pointerId);
+      } catch (err) {
+        // ohne Capture: pointerup am Knopf reicht
+      }
+      sipBridge.setPtt(call, true);
+    });
+    for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) {
+      b.addEventListener(type, () => sipBridge.setPtt(call, false));
+    }
+    // Langes Drücken öffnet am Tablet sonst das Kontextmenü.
+    b.addEventListener("contextmenu", (e) => e.preventDefault());
+    return b;
+  }
+
+  _sipMicState() {
+    const v = this._sipView;
+    if (!v || !v.mic) return;
+    const on = v.call.micOn;
+    v.mic.classList.toggle("muted", !on);
+    v.mic._icon.setAttribute("icon", on ? "mdi:microphone" : "mdi:microphone-off");
+    v.mic._label.textContent = on ? "Mikro an" : "Mikro aus";
+    if (v.ptt) v.ptt.classList.toggle("active", v.call.ptt);
+  }
+
+  // Anruf vorbei (aufgelegt, abgelehnt, Tür hat aufgelegt): kurz sagen, dann schließen.
+  _sipEnded(call) {
+    const v = this._sipView;
+    if (!v || v.call !== call) return;
+    this._sipView = null;
+    const noMic = call.cause === "User Denied Media Access";
+    this._popup.classList.remove("rang", "talking");
+    this._popupTitle.textContent = noMic ? "Kein Mikrofon" : v.phase === "talk" ? "Gespräch beendet" : "Anruf beendet";
+    this._popupSub.textContent = noMic ? "Mikrofon für Home Assistant im Browser freigeben" : call.cfg.name || "Klingel";
+    this._popupActions.innerHTML = "";
+    clearTimeout(this._sipEndTimer);
+    this._sipEndTimer = setTimeout(() => this._closeDoorbell(), noMic ? SIP_ERROR_HOLD_MS : SIP_END_HOLD_MS);
   }
 
   _buildUnlockButton(entityId) {
@@ -3914,10 +4346,19 @@ class ElvioRoomCard extends HTMLElement {
     return btn;
   }
 
+  // Schließt nur das Fenster. Ein SIP-Gespräch beenden die Knöpfe Ablehnen/Auflegen;
+  // währenddessen gibt es weder „×“ noch Tipp-daneben-zu.
   _closeDoorbell() {
     clearTimeout(this._popupTimer);
-    if (this._popup) this._popup.hidden = true;
-    // Karte entfernen beendet den Stream.
+    clearTimeout(this._sipEndTimer);
+    this._sipView = null;
+    if (this._popup) {
+      this._popup.hidden = true;
+      this._popup.classList.remove("sip", "talking");
+    }
+    // Karte entfernen beendet den Stream; ein noch ladendes Livebild verfällt.
+    this._popupCamToken = (this._popupCamToken || 0) + 1;
+    this._popupCamFor = undefined;
     if (this._popupVideo) this._popupVideo.innerHTML = "";
     this._popupCard = null;
   }
@@ -4151,6 +4592,16 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .pbtn.unlock { background: rgba(255,255,255,.9); color: #1f1f1f; }
 .pbtn.unlock.confirm { background: #f5a524; color: #1f1f1f; }
 .pbtn.unlock.done { background: #34c759; color: #fff; }
+/* Gegensprechen (SIP): während des Anrufs kein „×“ – Ablehnen/Auflegen beendet ihn. */
+.popup.sip .pclose { visibility: hidden; }
+.popup.talking .ptitle::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 10px;
+  border-radius: 50%; background: #34c759; vertical-align: middle; }
+.pbtn.accept { background: #34c759; color: #fff; animation: ring 1.6s ease-in-out infinite; }
+.pbtn.hangup { background: #ff453a; color: #fff; }
+.pbtn.accept:disabled, .pbtn.hangup:disabled { opacity: .6; animation: none; }
+.pbtn.mic.muted { background: #f5a524; color: #1f1f1f; }
+.pbtn.ptt { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.pbtn.ptt.active { background: #34c759; color: #fff; }
 
 .bg.media .bg-img { filter: blur(48px) saturate(150%) brightness(.8); transform: scale(1.25); }
 

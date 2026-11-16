@@ -51,7 +51,7 @@ die eigene Installation angepasst werden.
 |---|---|
 | `entity`, `climate`, `tv`, `action` | `entity` |
 | `lights` | `entities` (Liste von Lichtern) |
-| `doorbell` | `entity` (Klingel-Ereignis), optional `camera`, `unlock` (`button.*`, `input_button.*` oder `lock.*`) |
+| `doorbell` | `entity` (Klingel-Ereignis), optional `camera`, `unlock` (`button.*`, `input_button.*` oder `lock.*`), `sip_extension` (Gegensprechen, siehe unten) |
 | `agenda` | `entities` (Kalender), optional `days`, `max` |
 | `energy` | `solar` |
 | `service` | `path`, `url` oder `config_flow` |
@@ -77,6 +77,51 @@ und startet die App.
 **Ausstieg (`menu_path`):** immer auf ein normales Lovelace-Dashboard zeigen lassen, nicht auf
 `/home/overview`. kiosk-mode blendet die Seitenleiste sonst auch dort weiter aus, und unter iOS
 lässt sich das Menü nicht öffnen.
+
+## Gegensprechen über SIP Core
+
+Mit [SIP Core](https://github.com/TECH7Fox/sipcore-hass-integration) (HACS, getestet mit
+v5.1.2) läuft das Gespräch mit der Türsprechstelle im Klingel-Popup der Karte: **Annehmen**,
+**Ablehnen** bzw. **Auflegen**, **Mikro an/aus**, auf Wunsch eine Sprechtaste, dazu wie
+bisher **Tür öffnen** (zwei Tipps). Den Ton spielt SIP Core ab.
+
+```yaml
+- type: doorbell
+  name: Haustür
+  entity: input_text.klingel        # wie bisher (Klingel-Ereignis)
+  camera: camera.haustuer
+  unlock: button.haustuer_oeffnen
+  sip_extension: "900"              # Nebenstelle, von der die Tür anruft
+  # sip_push_to_talk: true          # Mikro startet aus, Knopf „Halten zum Sprechen“
+```
+
+| Option | Bedeutung |
+|---|---|
+| `sip_extension` | Ruft diese Nebenstelle an, öffnet sich das Popup – in jeder Ansicht des Dashboards, auch aus dem Bildschirmschoner. Andere Anrufer bleiben bei SIP Core. |
+| `sip_answer_dtmf` | Taste nach dem Annehmen, Standard `"1"` (die UniFi G3 Intercom gibt das Gespräch erst danach frei). `""` schaltet sie ab. |
+| `sip_dtmf_mode` | `info` (Standard, SIP INFO wie die DTMF-Knöpfe von SIP Core) oder `rfc2833` |
+| `sip_push_to_talk` | `true`: Mikro startet aus, zusätzlich „Halten zum Sprechen“ |
+
+Damit nicht zusätzlich das Popup von SIP Core aufgeht: Einstellungen → Geräte & Dienste →
+SIP Core → **Konfigurieren**, beim Benutzer des Tablets eine Ausnahme eintragen und das
+Tablet danach neu laden:
+
+```yaml
+users:
+  - ha_username: Tablet             # HA-Benutzer, mit dem das Tablet angemeldet ist
+    extension: "100"
+    password: "…"                   # unverändert lassen
+    overrides:
+      popup_config:
+        auto_open: false
+```
+
+`auto_open: false` öffnet das SIP-Core-Popup nicht mehr von selbst (der Telefon-Knopf in der
+Kopfzeile bleibt). Statt `overrides` beim Benutzer wirkt `popup_config.auto_open: false`
+oben in der Konfiguration für alle Geräte.
+
+Ohne SIP Core oder ohne `sip_extension` bleibt die Kachel, wie sie war. Selbst bei der Tür
+anrufen (ohne dass jemand klingelt) gibt es nicht.
 
 ## Einrichtung auf Knopfdruck
 
