@@ -1342,6 +1342,115 @@ const ElvioNotices = {
   },
 };
 
+// ───────────── Taster belegen ─────────────
+// Ein Taster (Ereignis-Entität, z. B. Shelly-Eingang) bekommt je Drückart eine Aktion. Je Taster
+// eine HA-Automation „Taster: …“ – sie läuft auch ohne Tablet. Getestet in test/buttons.test.mjs.
+
+const BUTTON_PRESSES = [
+  { type: "single_push", label: "1× drücken", short: "1×" },
+  { type: "double_push", label: "2× drücken", short: "2×" },
+  { type: "triple_push", label: "3× drücken", short: "3×" },
+  { type: "long_push", label: "Lang drücken", short: "lang" },
+];
+
+const ElvioButtons = {
+  isButton(st) {
+    if (!st || !String(st.entity_id).startsWith("event.")) return false;
+    const a = st.attributes || {};
+    if (a.device_class === "doorbell") return false;
+    return BUTTON_PRESSES.some((p) => (a.event_types || []).includes(p.type));
+  },
+
+  presses(eventTypes) {
+    return BUTTON_PRESSES.filter((p) => (eventTypes || []).includes(p.type)).map((p) => ({ ...p }));
+  },
+
+  automationId(entityId) {
+    return `elvio_taster_${String(entityId).replace(/^event\./, "").replace(/[^a-z0-9_]/g, "_")}`;
+  },
+
+  // Belegung → HA-Aktion. „other“ ist eine fremde (in HA bearbeitete) Aktion und bleibt, wie sie ist.
+  action(a) {
+    if (!a) return null;
+    if (a.kind === "toggle") return a.targets && a.targets.length ? { action: "homeassistant.toggle", target: { entity_id: [...a.targets] } } : null;
+    if (a.kind === "scene") return a.scene ? { action: "scene.turn_on", target: { entity_id: a.scene } } : null;
+    if (a.kind === "leave") return { action: "script.turn_on", target: { entity_id: `script.${LEAVE_SCRIPT}` } };
+    if (a.kind === "all_off") return { action: "light.turn_off", target: { entity_id: "all" } };
+    if (a.kind === "other" && Array.isArray(a.sequence)) return a.sequence;
+    return null;
+  },
+
+  automation(entityId, name, map) {
+    const choose = [];
+    for (const p of BUTTON_PRESSES) {
+      const act = ElvioButtons.action((map || {})[p.type]);
+      if (!act) continue;
+      choose.push({
+        conditions: [{ condition: "state", entity_id: entityId, attribute: "event_type", state: p.type }],
+        sequence: Array.isArray(act) ? act : [act],
+      });
+    }
+    if (!choose.length) return null;
+    return {
+      id: ElvioButtons.automationId(entityId),
+      alias: `Taster: ${name}`,
+      description: "Angelegt von der Raumkarte (Raum → Geräte → Taster).",
+      triggers: [{ trigger: "state", entity_id: entityId, not_from: ["unavailable"] }],
+      conditions: [],
+      actions: [{ choose }],
+      mode: "queued",
+    };
+  },
+
+  parse(cfg) {
+    const map = {};
+    const choose = (((cfg && cfg.actions) || [])[0] || {}).choose || [];
+    for (const c of choose) {
+      const type = ((c.conditions || [])[0] || {}).state;
+      const seq = c.sequence || [];
+      const s = seq[0] || {};
+      const ids = (t) => {
+        const e = (t && t.entity_id) || [];
+        return Array.isArray(e) ? e : [e];
+      };
+      let a = { kind: "other", sequence: seq };
+      if (seq.length === 1 && s.action === "homeassistant.toggle") a = { kind: "toggle", targets: ids(s.target) };
+      else if (seq.length === 1 && s.action === "scene.turn_on") a = { kind: "scene", scene: ids(s.target)[0] };
+      else if (seq.length === 1 && s.action === "script.turn_on" && ids(s.target)[0] === `script.${LEAVE_SCRIPT}`) a = { kind: "leave" };
+      else if (seq.length === 1 && s.action === "light.turn_off" && ids(s.target)[0] === "all") a = { kind: "all_off" };
+      if (type) map[type] = a;
+    }
+    return map;
+  },
+
+  describe(a, nameOf) {
+    if (!a) return "";
+    if (a.kind === "toggle") {
+      const n = (a.targets || []).map(nameOf);
+      return n.length > 2 ? `${n.slice(0, 2).join(", ")} +${n.length - 2}` : n.join(", ");
+    }
+    if (a.kind === "scene") return nameOf(a.scene);
+    if (a.kind === "leave") return "Haus verlassen";
+    if (a.kind === "all_off") return "Alle Lichter aus";
+    if (a.kind === "other") return "eigene Aktion";
+    return "";
+  },
+
+  summary(map, nameOf) {
+    return BUTTON_PRESSES.map((p) => [p, ElvioButtons.describe((map || {})[p.type], nameOf)])
+      .filter(([, d]) => d)
+      .map(([p, d]) => `${p.short}: ${d}`)
+      .join(" · ");
+  },
+
+  lastPress(st) {
+    const a = (st && st.attributes) || {};
+    const p = BUTTON_PRESSES.find((x) => x.type === a.event_type);
+    const at = Date.parse(st && st.state);
+    return p && Number.isFinite(at) ? { label: p.short, at } : null;
+  },
+};
+
 // ───────────── Gegensprechen über SIP Core ─────────────
 // SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
 // Änderung als Ereignis „sipcore-update“ am window. Benutzt werden nur: callState
@@ -1709,6 +1818,10 @@ class ElvioRoomCard extends HTMLElement {
       if (regChanged && this._editMode === "views") this._renderViews();
       if (this._editMode === "leave") this._renderLeave(true);
       if (this._editMode === "notices") this._renderNotices(true);
+      if (this._editMode === "button" && this._buttonDraft && !this._buttonDraft.type) {
+        const st = hass.states[this._buttonDraft.id];
+        if (st && st.state !== this._buttonLastKey) this._renderButton();
+      }
       // Neues Stockwerk aus dem Raum-Blatt: erst jetzt kennt hass.floors es als Auswahl.
       if (prev && hass.floors !== prev.floors && this._editMode === "room") this._renderRoomForm();
       if (this._editMode === "automations") this._renderAutomations();
@@ -1727,6 +1840,7 @@ class ElvioRoomCard extends HTMLElement {
     const sceneForm = open && this._editMode === "scene" && !!this._sceneDraft;
     const leaveOpen = open && this._editMode === "leave";
     const noticesOpen = open && this._editMode === "notices";
+    const buttonOpen = open && this._editMode === "button" && !!this._buttonDraft;
     const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
     const energyOpen = this._energyWrap && !this._energyWrap.hidden;
     const peopleOpen = this._peopleWrap && !this._peopleWrap.hidden;
@@ -1764,6 +1878,11 @@ class ElvioRoomCard extends HTMLElement {
       this._renderSceneForm();
     }
     if (noticesOpen) this._openNotices();
+    if (buttonOpen) {
+      this._editMode = "button";
+      this._editWrap.hidden = false;
+      this._renderButton();
+    }
     if (leaveOpen) {
       this._editMode = "leave";
       this._editActions.replaceChildren();
@@ -5850,6 +5969,237 @@ class ElvioRoomCard extends HTMLElement {
     }
   }
 
+  // ───────────── Taster belegen ─────────────
+
+  _roomButtons(areaId) {
+    const hass = this._hass;
+    return this._areaEntities(areaId)
+      .map((e) => e.entity_id)
+      .filter((id) => ElvioButtons.isButton(hass.states[id]))
+      .sort((a, b) => this._buttonName(a).localeCompare(this._buttonName(b), "de"));
+  }
+
+  // „EG-A1 Taster Treppe EG“ → „Taster Treppe EG“ (das Kürzel des Shellys steht klein darunter).
+  _buttonName(id) {
+    return this._friendly(id).replace(/^[A-Z]{2}-[A-Z]\d+\s+/, "");
+  }
+
+  _buttonAutomation(id) {
+    const autoId = ElvioButtons.automationId(id);
+    return Object.values(this._hass.states).find((st) => st.entity_id.startsWith("automation.") && st.attributes.id === autoId) || null;
+  }
+
+  // Belegungen der Taster dieses Raums aus ihren Automationen lesen (nur Admins dürfen das).
+  async _loadButtonCfgs() {
+    const areaId = this._areaId();
+    if (!areaId || !this._isAdmin()) return;
+    const cfgs = (this._buttonCfgs = this._buttonCfgs || {});
+    const todo = this._roomButtons(areaId).filter((id) => cfgs[id] === undefined);
+    await Promise.all(
+      todo.map(async (id) => {
+        if (!this._buttonAutomation(id)) {
+          cfgs[id] = {};
+          return;
+        }
+        try {
+          cfgs[id] = ElvioButtons.parse(await this._hass.callApi("GET", `config/automation/config/${ElvioButtons.automationId(id)}`));
+        } catch (err) {
+          cfgs[id] = {};
+        }
+      }),
+    );
+    if (todo.length && this._editMode === "devices") this._renderEdit();
+  }
+
+  async _openButton(id) {
+    this._buttonDraft = { id, map: null, type: null };
+    this._editMode = "button";
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      const d = this._buttonDraft;
+      if (d && d.type) {
+        d.type = null;
+        this._renderButton();
+      } else {
+        this._buttonDraft = null;
+        this._openEdit();
+      }
+    });
+    this._editActions.replaceChildren(back);
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderButton();
+    const d = this._buttonDraft;
+    let map = {};
+    if (this._buttonAutomation(id)) {
+      try {
+        map = ElvioButtons.parse(await this._hass.callApi("GET", `config/automation/config/${ElvioButtons.automationId(id)}`));
+      } catch (err) {
+        this._roomFormError(`Belegung nicht geladen: ${setupErrText(err)}`);
+      }
+    }
+    if (this._buttonDraft !== d) return;
+    d.map = map;
+    this._renderButton();
+  }
+
+  _renderButton() {
+    if (this._editMode !== "button" || this._editWrap.hidden || !this._buttonDraft) return;
+    const d = this._buttonDraft;
+    const hass = this._hass;
+    const st = hass.states[d.id];
+    const list = this._editList;
+    list.innerHTML = "";
+    this._buttonLastKey = st ? st.state : null;
+    if (d.type) return this._renderButtonPick();
+    this._editTitle.textContent = this._buttonName(d.id);
+    const last = ElvioButtons.lastPress(st);
+    const shelly = (this._friendly(d.id).match(/^([A-Z]{2}-[A-Z]\d+)\s/) || [])[1];
+    this._editHint.textContent = [
+      shelly,
+      last ? `Zuletzt gedrückt: ${last.label} · ${ElvioPeople.since(last.at, Date.now())}` : "Noch nicht gedrückt – zum Erkennen einmal drücken",
+    ].filter(Boolean).join(" · ");
+    if (!d.map) {
+      list.appendChild(el("div", "ag-empty", "Belegung wird geladen …"));
+      return;
+    }
+    const presses = ElvioButtons.presses((st && st.attributes.event_types) || []);
+    for (const p of presses) {
+      const desc = ElvioButtons.describe(d.map[p.type], (x) => this._friendly(x));
+      const r = el("button", "erow epick");
+      const i = el("div", "eicon");
+      i.appendChild(icon(d.map[p.type] && desc ? "mdi:gesture-tap" : "mdi:gesture-tap-hold"));
+      const t = el("div", "etext");
+      t.append(el("div", "sname", p.label), el("div", "ssub", desc || "Nichts"));
+      r.append(i, t, icon("mdi:chevron-right"));
+      r.addEventListener("click", () => {
+        d.type = p.type;
+        this._renderButton();
+      });
+      list.appendChild(r);
+    }
+    list.appendChild(
+      el("div", "ehint", "Schaltet der Taster schon direkt am Shelly ein Licht (Eingang gekoppelt), hier „1× drücken“ frei lassen – sonst schaltet es doppelt."),
+    );
+    const save = el("button", "pbtn unlock esave", "Speichern");
+    save.addEventListener("click", () => this._saveButton(save));
+    list.appendChild(save);
+  }
+
+  // Auswahl für eine Drückart: Nichts, Umschalten (Geräte anhaken), Szene, Haus verlassen, Alle Lichter aus.
+  _renderButtonPick() {
+    const d = this._buttonDraft;
+    const hass = this._hass;
+    const list = this._editList;
+    const p = BUTTON_PRESSES.find((x) => x.type === d.type);
+    this._editTitle.textContent = `${this._buttonName(d.id)} · ${p.label}`;
+    this._editHint.textContent = "Was soll passieren?";
+    const cur = d.map[d.type] || { kind: "none" };
+    const choice = (kind, ic, label, sub) => {
+      const r = el("button", "erow epick bchoice");
+      r.classList.toggle("on", cur.kind === kind);
+      const i = el("div", "eicon");
+      i.appendChild(icon(ic));
+      const t = el("div", "etext");
+      t.append(el("div", "sname", label), el("div", "ssub", sub || ""));
+      r.append(i, t, icon(cur.kind === kind ? "mdi:radiobox-marked" : "mdi:radiobox-blank"));
+      r.addEventListener("click", () => {
+        if (cur.kind === kind) return;
+        d.map[d.type] = kind === "toggle" ? { kind, targets: [] } : kind === "scene" ? { kind, scene: null } : { kind };
+        this._renderButton();
+      });
+      return r;
+    };
+    list.appendChild(choice("none", "mdi:cancel", "Nichts"));
+    list.appendChild(choice("toggle", "mdi:toggle-switch-outline", "Umschalten", "Lichter, Steckdosen, Rollläden an bzw. aus"));
+    if (cur.kind === "toggle") {
+      const areaId = this._areaId();
+      const reg = hass.entities || {};
+      const ok = (id) => /^(light|switch|cover|fan)\./.test(id) && hass.states[id];
+      const here = this._areaEntities(areaId).map((e) => e.entity_id).filter(ok);
+      const order = (a, b) => (a.startsWith("light.") ? 0 : 1) - (b.startsWith("light.") ? 0 : 1) || this._friendly(a).localeCompare(this._friendly(b), "de");
+      here.sort(order);
+      const others = Object.values(reg)
+        .filter((e) => !e.hidden && !e.entity_category && ok(e.entity_id) && !here.includes(e.entity_id))
+        .map((e) => e.entity_id)
+        .sort(order);
+      const areaName = (id) => {
+        const a = this._entityArea(reg[id]);
+        return a ? ((hass.areas || {})[a] || {}).name || a : "Ohne Raum";
+      };
+      const row = (id, where) => {
+        const r = this._infoRow(this._defaultIcon(hass.states[id]), this._friendly(id), where ? areaName(id) : ElvioScenes.describe(hass.states[id]));
+        const sw = el("button", "lswitch");
+        sw.classList.toggle("on", cur.targets.includes(id));
+        sw.addEventListener("click", () => {
+          cur.targets = cur.targets.includes(id) ? cur.targets.filter((x) => x !== id) : [...cur.targets, id];
+          sw.classList.toggle("on", cur.targets.includes(id));
+        });
+        r.classList.add("bsub");
+        r.appendChild(sw);
+        return r;
+      };
+      for (const id of here) list.appendChild(row(id, false));
+      const open = this._buttonOthersOpen || others.some((id) => cur.targets.includes(id));
+      if (others.length) {
+        list.appendChild(this._foldButton(`Andere Räume (${others.length})`, open, () => {
+          this._buttonOthersOpen = !open;
+          this._renderButton();
+        }));
+        if (open) for (const id of others) list.appendChild(row(id, true));
+      }
+    }
+    list.appendChild(choice("scene", "mdi:palette-outline", "Szene", "Eine Szene aktivieren"));
+    if (cur.kind === "scene") {
+      const areaId = this._areaId();
+      const reg = hass.entities || {};
+      const scenes = Object.values(hass.states)
+        .filter((x) => x.entity_id.startsWith("scene."))
+        .sort((a, b) => (this._entityArea(reg[a.entity_id]) === areaId ? 0 : 1) - (this._entityArea(reg[b.entity_id]) === areaId ? 0 : 1) || this._friendly(a.entity_id).localeCompare(this._friendly(b.entity_id), "de"));
+      if (!scenes.length) list.appendChild(el("div", "ehint", "Noch keine Szenen – im Raum unter dem Titel „+ Szene“."));
+      for (const sc of scenes) {
+        const r = this._infoRow(sc.attributes.icon || "mdi:palette-outline", this._friendly(sc.entity_id), "");
+        r.classList.add("bsub", "epick");
+        r.appendChild(icon(cur.scene === sc.entity_id ? "mdi:radiobox-marked" : "mdi:radiobox-blank"));
+        r.addEventListener("click", () => {
+          cur.scene = sc.entity_id;
+          this._renderButton();
+        });
+        list.appendChild(r);
+      }
+    }
+    if (hass.states[`script.${LEAVE_SCRIPT}`] || cur.kind === "leave") {
+      list.appendChild(choice("leave", "mdi:home-export-outline", "Haus verlassen", "Wie der Knopf auf Zuhause"));
+    }
+    list.appendChild(choice("all_off", "mdi:lightbulb-group-off-outline", "Alle Lichter aus", "Im ganzen Haus"));
+    if (cur.kind === "other") list.appendChild(choice("other", "mdi:code-braces", "Eigene Aktion", "In Home Assistant bearbeitet – bleibt so"));
+    const done = el("button", "pbtn unlock esave", "Fertig");
+    done.addEventListener("click", () => {
+      d.type = null;
+      this._renderButton();
+    });
+    list.appendChild(done);
+  }
+
+  async _saveButton(btn) {
+    const d = this._buttonDraft;
+    const hass = this._hass;
+    btn.disabled = true;
+    this._editMsg.hidden = true;
+    const autoId = ElvioButtons.automationId(d.id);
+    try {
+      const cfg = ElvioButtons.automation(d.id, this._buttonName(d.id), d.map);
+      if (cfg) await hass.callApi("POST", `config/automation/config/${autoId}`, cfg);
+      else if (this._buttonAutomation(d.id)) await hass.callApi("DELETE", `config/automation/config/${autoId}`);
+      (this._buttonCfgs = this._buttonCfgs || {})[d.id] = ElvioButtons.parse(cfg || {});
+      this._buttonDraft = null;
+      this._openEdit();
+    } catch (err) {
+      btn.disabled = false;
+      this._roomFormError(`Nicht gespeichert: ${setupErrText(err)}`);
+    }
+  }
+
   // ───────────── Haus verlassen ─────────────
 
   _openLeave() {
@@ -7719,6 +8069,7 @@ class ElvioRoomCard extends HTMLElement {
     this._editActions.replaceChildren(this._editAddBtn, this._editPairBtn);
     this._editWrap.hidden = false;
     this._renderEdit();
+    this._loadButtonCfgs();
   }
 
   _renderEdit() {
@@ -7731,11 +8082,31 @@ class ElvioRoomCard extends HTMLElement {
     const list = this._editList;
     list.innerHTML = "";
     const order = (e) => [AUTO_DOMAINS.includes(e.entity_id.split(".")[0]) ? 0 : 1, this._friendly(e.entity_id)];
-    const entities = this._areaEntities(areaId).sort((a, b) => {
-      const [x1, y1] = order(a);
-      const [x2, y2] = order(b);
-      return x1 - x2 || y1.localeCompare(y2, "de");
-    });
+    const buttons = this._roomButtons(areaId);
+    const entities = this._areaEntities(areaId)
+      .filter((e) => !buttons.includes(e.entity_id))
+      .sort((a, b) => {
+        const [x1, y1] = order(a);
+        const [x2, y2] = order(b);
+        return x1 - x2 || y1.localeCompare(y2, "de");
+      });
+    // Taster: was sie auf Druck tun (je Taster eine Automation), Antippen belegt sie.
+    if (buttons.length) {
+      list.appendChild(el("div", "esub", "Taster"));
+      for (const id of buttons) {
+        const map = (this._buttonCfgs || {})[id];
+        const sum = map ? ElvioButtons.summary(map, (x) => this._friendly(x)) : null;
+        const r = el("button", "erow epick");
+        const i = el("div", "eicon");
+        i.appendChild(icon("mdi:gesture-tap-button"));
+        const t = el("div", "etext");
+        t.append(el("div", "sname", this._buttonName(id)), el("div", "ssub", map === undefined ? "…" : sum || "Noch nicht belegt"));
+        r.append(i, t, icon("mdi:chevron-right"));
+        r.addEventListener("click", () => this._openButton(id));
+        list.appendChild(r);
+      }
+      list.appendChild(el("div", "esub", "Geräte"));
+    }
     if (!entities.length) {
       list.appendChild(el("div", "ehint", "Diesem Raum ist noch nichts zugeordnet. Mit „+ Hinzufügen“ holst du Kameras, Sensoren und Geräte her."));
     }
@@ -8939,6 +9310,8 @@ header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-i
 .erow.notice.updates .eicon, .erow.notice.repairs .eicon { background: rgba(255,255,255,.12); }
 .erow.notice.ignored { opacity: .6; }
 .etext.elink { cursor: pointer; }
+.erow.bsub { padding-left: 24px; }
+.erow.bchoice.on .sname { font-weight: 650; }
 .escrow { border-bottom: 1px solid rgba(255,255,255,.08); }
 .escrow > .erow { border-bottom: 0; }
 .esc-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 0 0 14px 48px; }

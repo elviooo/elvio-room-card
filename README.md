@@ -165,6 +165,16 @@ scenes.yaml` in der `configuration.yaml`), am Bereich des Raums – sie funktion
 in Automationen und per Sprache. Zuhause erkennt die Karte am ersten Leisten-Eintrag;
 `scenes: true` bzw. `scenes: false` in einer Karte zeigt bzw. versteckt die Reihe ausdrücklich.
 
+## Taster belegen
+
+Im Raum über **„Geräte“** (Admin) steht oben der Abschnitt **„Taster“** mit allen Tastern des
+Raums (Ereignis-Entitäten wie die Eingänge von Shellys) und was sie tun. Antippen öffnet den
+Taster: „Zuletzt gedrückt“ läuft live mit (zum Erkennen einmal drücken), darunter je Drückart –
+1×, 2×, 3×, lang – eine Aktion: Lichter, Steckdosen, Rollläden **umschalten**, eine **Szene**,
+**Haus verlassen** (wenn eingestellt), **alle Lichter aus** oder nichts. Gespeichert wird je
+Taster eine HA-Automation „Taster: …“ (läuft auch ohne Tablet); in HA geänderte Aktionen bleiben
+erhalten. Schaltet ein Eingang schon direkt am Shelly (gekoppelt), „1× drücken“ frei lassen.
+
 ## Hinweise
 
 Auf Zuhause erscheint ein Chip **„2 Hinweise“**, sobald im Haus etwas nicht stimmt (rot bei
