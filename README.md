@@ -165,6 +165,20 @@ scenes.yaml` in der `configuration.yaml`), am Bereich des Raums – sie funktion
 in Automationen und per Sprache. Zuhause erkennt die Karte am ersten Leisten-Eintrag;
 `scenes: true` bzw. `scenes: false` in einer Karte zeigt bzw. versteckt die Reihe ausdrücklich.
 
+## Haus verlassen
+
+Auf Zuhause steht vorn in der Szenen-Reihe **„Haus verlassen“** (für alle). Antippen zeigt eine
+Prüfliste – was noch offen ist (Fenster, Türen, Tore), welche Lichter an sind, welche gewählten
+Steckdosen an sind, ob Musik läuft – und **„Alles aus“** schaltet alles ab.
+
+Mit Admin-Anmeldung legt **„Einstellen“** fest, welche Steckdosen mit ausgehen (keine
+voreingestellt), ob Musik angehalten wird und ob das automatisch passiert, wenn 10 Minuten
+niemand zuhause ist (nur sinnvoll, wenn jeder Bewohner ein Handy mit Standort hat). Gespeichert
+wird als Skript `script.haus_verlassen` (auch per Sprache und in Automationen nutzbar), die
+Automatik als Automation, die Auswahl zusätzlich unter `elvio_leave` in der Dashboard-
+Konfiguration. Ohne Einstellung macht der Knopf alle Lichter aus und hält laufende Musik an.
+`leave: false` in der Karte blendet den Knopf aus.
+
 ## Personen
 
 Ein Eintrag **„Personen“** in der Leiste (hinter „Räume“) zeigt, wer wo ist – im Design der

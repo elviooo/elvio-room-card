@@ -1184,6 +1184,65 @@ const ElvioScenes = {
   },
 };
 
+// ───────────── Haus verlassen ─────────────
+// Ein Knopf auf Zuhause: Prüfliste (was offen ist, was ausgeht), dann alles aus. Dahinter ein
+// echtes HA-Skript (script.haus_verlassen), auf Wunsch eine Automation, wenn alle weg sind.
+// Die Einstellung steht in der Dashboard-Konfiguration (elvio_leave), damit auch Nicht-Admins
+// sehen, was ausgeht. Getestet in test/leave.test.mjs.
+
+const LEAVE_SCRIPT = "haus_verlassen";
+const LEAVE_AUTOMATION = "elvio_haus_verlassen";
+// Schalter dieser Integrationen sind Sicherheits- oder Kamerafunktionen (Abriegelung,
+// Evakuierung, Privatsphäre …), keine Verbraucher – sie stehen nicht zur Auswahl.
+const LEAVE_SKIP_PLATFORMS = ["unifi_access", "unifiprotect", "alarmo", "ring", "reolink", "frigate"];
+
+const ElvioLeave = {
+  settings(dashCfg) {
+    const l = (dashCfg && dashCfg.elvio_leave) || {};
+    return {
+      switches: Array.isArray(l.switches) ? l.switches.filter((x) => typeof x === "string") : [],
+      media: l.media !== false,
+      auto: l.auto === true,
+    };
+  },
+
+  // Das Skript: alle Lichter aus, gewählte Steckdosen aus, Musik anhalten. Ein Fehler (z. B. ein
+  // Gerät nicht erreichbar) hält die übrigen Schritte nicht auf.
+  script({ switches, media, players }) {
+    const step = (action, entity_id) => ({ action, target: { entity_id }, continue_on_error: true });
+    const sequence = [step("light.turn_off", "all")];
+    if (switches && switches.length) sequence.push(step("switch.turn_off", [...switches]));
+    if (media && players && players.length) sequence.push(step("media_player.media_pause", [...players]));
+    return { alias: "Haus verlassen", icon: "mdi:home-export-outline", mode: "single", sequence };
+  },
+
+  // Automatisch, wenn niemand mehr zuhause ist (zone.home zählt die Personen daheim).
+  automation() {
+    return {
+      id: LEAVE_AUTOMATION,
+      alias: "Haus verlassen, wenn alle weg sind",
+      description: "Angelegt von der Raumkarte (Haus verlassen → Einstellen).",
+      triggers: [{ trigger: "state", entity_id: "zone.home", to: "0", for: { minutes: 10 } }],
+      conditions: [],
+      actions: [{ action: "script.turn_on", target: { entity_id: `script.${LEAVE_SCRIPT}` } }],
+      mode: "single",
+    };
+  },
+
+  // Was der Knopf jetzt ausschalten würde.
+  plan(states, settings) {
+    const all = Object.values(states || {});
+    const on = (st) => st.state === "on";
+    return {
+      lights: all.filter((st) => st.entity_id.startsWith("light.") && on(st)).map((st) => st.entity_id),
+      switches: (settings.switches || []).filter((id) => states[id] && on(states[id])),
+      playing: settings.media
+        ? all.filter((st) => st.entity_id.startsWith("media_player.") && st.state === "playing").map((st) => st.entity_id)
+        : [],
+    };
+  },
+};
+
 // ───────────── Gegensprechen über SIP Core ─────────────
 // SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
 // Änderung als Ereignis „sipcore-update“ am window. Benutzt werden nur: callState
@@ -1549,6 +1608,7 @@ class ElvioRoomCard extends HTMLElement {
     if (this._editWrap && !this._editWrap.hidden) {
       if (regChanged && this._editMode === "devices") this._renderEdit();
       if (regChanged && this._editMode === "views") this._renderViews();
+      if (this._editMode === "leave") this._renderLeave(true);
       // Neues Stockwerk aus dem Raum-Blatt: erst jetzt kennt hass.floors es als Auswahl.
       if (prev && hass.floors !== prev.floors && this._editMode === "room") this._renderRoomForm();
       if (this._editMode === "automations") this._renderAutomations();
@@ -1565,6 +1625,7 @@ class ElvioRoomCard extends HTMLElement {
     const roomForm = open && this._editMode === "room" && !!this._roomDraft;
     const floorForm = open && this._editMode === "floor" && !!this._floorDraft;
     const sceneForm = open && this._editMode === "scene" && !!this._sceneDraft;
+    const leaveOpen = open && this._editMode === "leave";
     const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
     const energyOpen = this._energyWrap && !this._energyWrap.hidden;
     const peopleOpen = this._peopleWrap && !this._peopleWrap.hidden;
@@ -1600,6 +1661,13 @@ class ElvioRoomCard extends HTMLElement {
       this._editActions.replaceChildren();
       this._editWrap.hidden = false;
       this._renderSceneForm();
+    }
+    if (leaveOpen) {
+      this._editMode = "leave";
+      this._editActions.replaceChildren();
+      this._editWrap.hidden = false;
+      this._leaveKey = null;
+      this._renderLeave();
     }
   }
 
@@ -5111,12 +5179,24 @@ class ElvioRoomCard extends HTMLElement {
     const here = this._scenesHere();
     const admin = this._isAdmin();
     const list = here ? here.scenes : [];
-    const key = JSON.stringify([!!here, here && here.areaId, admin, list.map((x) => [x.entity_id, x.attributes.friendly_name, x.attributes.icon])]);
+    // Zuhause (Szenen ohne Bereich) bekommt vorn „Haus verlassen“ – für alle, nicht nur Admins.
+    const leave = !!here && !here.areaId && this._config.leave !== false;
+    const key = JSON.stringify([!!here, here && here.areaId, admin, leave, list.map((x) => [x.entity_id, x.attributes.friendly_name, x.attributes.icon])]);
     if (key === this._sceneKey) return;
     this._sceneKey = key;
     box.innerHTML = "";
-    box.hidden = !here || (!list.length && !admin);
+    box.hidden = !here || (!list.length && !admin && !leave);
     if (box.hidden) return;
+    if (leave) {
+      const b = el("button", "chip scene leave");
+      const av = el("div", "av");
+      av.appendChild(icon("mdi:home-export-outline"));
+      const txt = el("div", "txt");
+      txt.appendChild(el("b", "", "Haus verlassen"));
+      b.append(av, txt);
+      b.addEventListener("click", () => this._openLeave());
+      box.appendChild(b);
+    }
     for (const sc of list) box.appendChild(this._sceneChip(sc, admin));
     if (admin) {
       const add = el("button", "chip scene sceneadd");
@@ -5506,6 +5586,226 @@ class ElvioRoomCard extends HTMLElement {
     } catch (err) {
       btn.disabled = false;
       this._roomFormError(`Nicht gelöscht: ${setupErrText(err)}`);
+    }
+  }
+
+  // ───────────── Haus verlassen ─────────────
+
+  _openLeave() {
+    this._leaveView = "check";
+    this._leaveDraft = null;
+    this._leaveKey = null;
+    this._editMode = "leave";
+    this._editActions.replaceChildren();
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderLeave();
+  }
+
+  _leaveSettings() {
+    const d = this._dashboardConfig();
+    if (d) this._leaveCfgLast = d;
+    return ElvioLeave.settings(d || this._leaveCfgLast || null);
+  }
+
+  // Eine Zeile ohne Bedienung: Symbol, Text, Zusatz.
+  _infoRow(ic, title, sub, cls = "") {
+    const r = el("div", `erow ${cls}`);
+    const i = el("div", "eicon");
+    i.appendChild(icon(ic));
+    const t = el("div", "etext");
+    t.append(el("div", "sname", title), el("div", "ssub", sub || ""));
+    r.append(i, t);
+    return r;
+  }
+
+  // Prüfliste: was offen ist, was ausgeht. soft: nur neu zeichnen, wenn sich etwas geändert hat
+  // (wird bei jedem Update aufgerufen, damit die Liste stimmt).
+  _renderLeave(soft = false) {
+    if (this._editMode !== "leave" || this._editWrap.hidden) return;
+    if (this._leaveView === "settings") {
+      if (!soft) this._renderLeaveSettings();
+      return;
+    }
+    const hass = this._hass;
+    const settings = this._leaveSettings();
+    const plan = ElvioLeave.plan(hass.states, settings);
+    const open = this._openThings();
+    const admin = this._isAdmin();
+    const key = JSON.stringify([this._leaveView, plan, open.map((st) => st.entity_id), settings, admin]);
+    if (soft && key === this._leaveKey) return;
+    this._leaveKey = key;
+    const list = this._editList;
+    list.innerHTML = "";
+    this._editTitle.textContent = "Haus verlassen";
+    if (this._leaveView === "done") {
+      this._editHint.textContent = "";
+      const box = el("div", "cbox");
+      box.append(icon("mdi:check-circle-outline"), el("div", "ctitle", "Erledigt"), el("div", "ctext", "Alles aus – bis später."));
+      list.appendChild(box);
+      return;
+    }
+    this._editHint.textContent = "Kurz prüfen, dann alles aus.";
+    if (open.length) {
+      list.appendChild(el("div", "esub", "Noch offen"));
+      for (const st of open) {
+        list.appendChild(this._infoRow(this._defaultIcon(st) === "mdi:information-outline" ? "mdi:door-open" : this._defaultIcon(st), st.attributes.friendly_name || st.entity_id, "offen – bitte schließen", "warn"));
+      }
+    }
+    const names = (ids) => ids.map((id) => this._friendly(id));
+    const short = (arr) => (arr.length > 4 ? `${arr.slice(0, 4).join(", ")} …` : arr.join(", "));
+    list.appendChild(el("div", "esub", "Wird ausgeschaltet"));
+    const n = plan.lights.length;
+    list.appendChild(this._infoRow("mdi:lightbulb-group-outline", n ? `${n} ${n === 1 ? "Licht" : "Lichter"} an` : "Alle Lichter sind aus", short(names(plan.lights))));
+    if (settings.switches.length) {
+      const k = plan.switches.length;
+      list.appendChild(
+        this._infoRow("mdi:power-socket-de", k ? `${k} ${k === 1 ? "Steckdose" : "Steckdosen"} an` : "Gewählte Steckdosen sind aus", short(names(settings.switches))),
+      );
+    }
+    if (settings.media) {
+      list.appendChild(this._infoRow("mdi:music", plan.playing.length ? "Musik läuft – wird angehalten" : "Keine Musik an", short(names(plan.playing))));
+    }
+    if (settings.auto) list.appendChild(el("div", "ehint", "Automatisch: Ist 10 Minuten niemand zuhause, geht das von selbst."));
+    const go = el("button", "pbtn unlock esave", "Alles aus");
+    go.addEventListener("click", () => this._runLeave(go));
+    list.appendChild(go);
+    if (admin) {
+      const set = el("button", "stextbtn emeta", "Einstellen");
+      set.addEventListener("click", () => {
+        this._leaveView = "settings";
+        this._renderLeave();
+      });
+      list.appendChild(set);
+    }
+  }
+
+  async _runLeave(btn) {
+    const hass = this._hass;
+    btn.disabled = true;
+    this._editMsg.hidden = true;
+    try {
+      if (hass.states[`script.${LEAVE_SCRIPT}`]) {
+        await hass.callService("script", "turn_on", { entity_id: `script.${LEAVE_SCRIPT}` });
+      } else {
+        // Noch nicht eingestellt: alle Lichter aus, laufende Musik anhalten.
+        await hass.callService("light", "turn_off", { entity_id: "all" });
+        const playing = ElvioLeave.plan(hass.states, { switches: [], media: true }).playing;
+        if (playing.length) await hass.callService("media_player", "media_pause", { entity_id: playing }).catch(() => {});
+      }
+      this._leaveView = "done";
+      this._renderLeave();
+      setTimeout(() => {
+        if (this._editMode === "leave" && this._leaveView === "done") this._editWrap.hidden = true;
+      }, 2500);
+    } catch (err) {
+      btn.disabled = false;
+      this._roomFormError(`Nicht ausgeführt: ${setupErrText(err)}`);
+    }
+  }
+
+  _renderLeaveSettings() {
+    const hass = this._hass;
+    if (!this._leaveDraft) {
+      const cur = this._leaveSettings();
+      this._leaveDraft = { ...cur, switches: [...cur.switches] };
+    }
+    const d = this._leaveDraft;
+    const list = this._editList;
+    list.innerHTML = "";
+    this._editTitle.textContent = "Haus verlassen einstellen";
+    this._editHint.textContent = "Wird als Skript „Haus verlassen“ in Home Assistant gespeichert – auch per Sprache und in Automationen nutzbar.";
+    const toggleRow = (ic, title, sub, on, flip) => {
+      const r = this._infoRow(ic, title, sub);
+      const sw = el("button", "lswitch");
+      sw.classList.toggle("on", on);
+      sw.addEventListener("click", () => {
+        flip();
+        this._renderLeaveSettings();
+      });
+      r.appendChild(sw);
+      return r;
+    };
+    list.appendChild(el("div", "esub", "Steckdosen ausschalten"));
+    const reg = hass.entities || {};
+    const areaName = (id) => {
+      const a = this._entityArea(reg[id]);
+      return a ? ((hass.areas || {})[a] || {}).name || a : "Ohne Raum";
+    };
+    const sockets = Object.values(reg)
+      .filter((e) => e.entity_id.startsWith("switch.") && !e.hidden && !e.entity_category && hass.states[e.entity_id])
+      .filter((e) => !LEAVE_SKIP_PLATFORMS.includes(e.platform) || d.switches.includes(e.entity_id))
+      .map((e) => e.entity_id)
+      .filter((id) => !/^reserve/i.test(this._friendly(id)) || d.switches.includes(id))
+      .sort((a, b) => areaName(a).localeCompare(areaName(b), "de") || this._friendly(a).localeCompare(this._friendly(b), "de"));
+    const socketRow = (id) =>
+      toggleRow("mdi:power-socket-de", this._friendly(id), areaName(id), d.switches.includes(id), () => {
+        d.switches = d.switches.includes(id) ? d.switches.filter((x) => x !== id) : [...d.switches, id];
+      });
+    // Schalter in Räumen zuerst; ohne Raum eingeklappt (oft Technik oder noch nicht zugeordnet).
+    const inRoom = sockets.filter((id) => this._entityArea(reg[id]));
+    const homeless = sockets.filter((id) => !this._entityArea(reg[id]));
+    if (!sockets.length) list.appendChild(el("div", "ehint", "Keine Steckdosen gefunden."));
+    for (const id of inRoom) list.appendChild(socketRow(id));
+    if (homeless.length) {
+      const open = this._leaveHomelessOpen || homeless.some((id) => d.switches.includes(id));
+      list.appendChild(this._foldButton(`Ohne Raum (${homeless.length})`, open, () => {
+        this._leaveHomelessOpen = !open;
+        this._renderLeaveSettings();
+      }));
+      if (open) for (const id of homeless) list.appendChild(socketRow(id));
+    }
+    list.appendChild(el("div", "esub", "Weiteres"));
+    list.appendChild(toggleRow("mdi:music", "Musik anhalten", "Laufende Lautsprecher pausieren", d.media, () => (d.media = !d.media)));
+    const nobody = this._people(true).every((p) => p.place.kind === "unknown");
+    list.appendChild(
+      toggleRow(
+        "mdi:account-arrow-right-outline",
+        "Automatisch, wenn alle weg sind",
+        "Nach 10 Minuten ohne Person zuhause. Nur, wenn jeder Bewohner ein Handy mit Standort hat – sonst geht das Licht aus, während jemand ohne Handy da ist.",
+        d.auto,
+        () => (d.auto = !d.auto),
+      ),
+    );
+    if (d.auto && nobody) list.appendChild(el("div", "ehint", "Gerade meldet kein Handy einen Standort – die Automatik greift erst, wenn das eingerichtet ist."));
+    const save = el("button", "pbtn unlock esave", "Speichern");
+    save.addEventListener("click", () => this._saveLeave(save));
+    const cancel = el("button", "stextbtn emeta", "Abbrechen");
+    cancel.addEventListener("click", () => {
+      this._leaveDraft = null;
+      this._leaveView = "check";
+      this._renderLeave();
+    });
+    list.append(save, cancel);
+  }
+
+  // Skript (und ggf. Automation) in HA schreiben, zuletzt die Einstellung ins Dashboard –
+  // danach lädt HA das Dashboard neu.
+  async _saveLeave(btn) {
+    const d = this._leaveDraft;
+    const hass = this._hass;
+    btn.disabled = true;
+    this._editMsg.hidden = true;
+    try {
+      const players = Object.values(hass.states)
+        .filter((st) => st.entity_id.startsWith("media_player.") && ((st.attributes.supported_features || 0) & 1))
+        .map((st) => st.entity_id);
+      await hass.callApi("POST", `config/script/config/${LEAVE_SCRIPT}`, ElvioLeave.script({ ...d, players }));
+      const hasAuto = Object.values(hass.states).some((st) => st.entity_id.startsWith("automation.") && st.attributes.id === LEAVE_AUTOMATION);
+      if (d.auto) await hass.callApi("POST", `config/automation/config/${LEAVE_AUTOMATION}`, ElvioLeave.automation());
+      else if (hasAuto) await hass.callApi("DELETE", `config/automation/config/${LEAVE_AUTOMATION}`);
+      const dash = this._dashPath();
+      const urlPath = dash === "lovelace" ? null : dash;
+      const cfg = await hass.callWS({ type: "lovelace/config", url_path: urlPath });
+      cfg.elvio_leave = { switches: d.switches, media: d.media, auto: d.auto };
+      await hass.callWS({ type: "lovelace/config/save", url_path: urlPath, config: cfg });
+      this._leaveCfgLast = cfg;
+      this._leaveDraft = null;
+      this._leaveView = "check";
+      this._renderLeave();
+    } catch (err) {
+      btn.disabled = false;
+      this._roomFormError(`Nicht gespeichert: ${setupErrText(err)}`);
     }
   }
 
@@ -8367,6 +8667,8 @@ header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-i
 .chip.scene b { font-size: 13px; }
 .chip.scene.fired { background: rgba(255,255,255,.9); color: #1f1f1f; }
 .chip.sceneadd { background: none; border-style: dashed; }
+.chip.leave { background: rgba(255,255,255,.2); }
+.erow.warn .eicon { background: rgba(196,45,45,.6); }
 .escrow { border-bottom: 1px solid rgba(255,255,255,.08); }
 .escrow > .erow { border-bottom: 0; }
 .esc-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 0 0 14px 48px; }
