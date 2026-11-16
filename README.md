@@ -135,6 +135,24 @@ views:
 - Getestet mit Home Assistant 2026.11 (Stockwerke, Bereichs-Reihenfolge und Temperatursensor
   am Bereich brauchen eine aktuelle Version).
 
+## Energie
+
+Ist in Home Assistant unter **Einstellungen → Dashboards → Energie** etwas eingetragen, steht in
+der Leiste der Eintrag **„Energie“** (hinter „Räume“); ein Tipp auf die Kachel `energy` öffnet
+dieselbe Seite. Keine eigene Ansicht nötig, alte Dashboards eingeschlossen. Jeder Teil erscheint
+nur, wenn es die Daten gibt:
+
+- **Jetzt:** Haus in der Mitte, Solar, Netz und Batterie drumherum, mit Watt und Fließrichtung
+  (Leistungssensoren aus den Energie-Einstellungen).
+- **Heute · Woche · Monat · Jahr:** Bezug und Einspeisung, Solar, Batterie rein/raus,
+  Verbrauch, Autarkie, Eigenverbrauch, Kosten und Vergütung, wenn ein Preis hinterlegt ist.
+- **Verlauf:** Balken je Stunde, Tag oder Monat – Bezug nach oben, Einspeisung nach unten,
+  Solar als Linie. Ohne Netzzähler der Verbrauch der eingetragenen Geräte.
+- **Verbraucher:** die Geräte aus den Energie-Einstellungen nach Verbrauch, mit Leistung jetzt.
+
+Nur Anzeige – gesteuert wird nichts. Verbraucher einzeln einzutragen erspart der
+Einrichtungspunkt „Energie einrichten“.
+
 ## Gegensprechen über SIP Core
 
 Mit [SIP Core](https://github.com/TECH7Fox/sipcore-hass-integration) (HACS, getestet mit
@@ -195,6 +213,7 @@ besten in einer Ansicht „Einstellungen“) prüft das und richtet es auf Knopf
 | Seitenleiste ausblenden | [kiosk-mode](https://github.com/NemesisRE/kiosk-mode) über HACS installieren, Kopf- und Seitenleiste in diesem Dashboard ausblenden (`?disable_km` zum Bearbeiten) |
 | Startseite für alle | Dieses Dashboard öffnet beim Start der App |
 | Räume aus Home Assistant | Nur bei alten Dashboards: sichern, Räume in die Bereiche übernehmen, auf die Ansicht `raum` umbauen |
+| Energie einrichten | Verbraucher mit eigenem Energiezähler (z. B. benannte Shelly-Kanäle, ohne Reserven und Einspeise-Zähler) mit ihrer Leistung in HA-Energie eintragen; Bestehendes bleibt |
 | Music Assistant | Add-on installieren, starten, mit Home Assistant verbinden (nur Home Assistant OS) |
 | Push: günstig tanken | Nur mit Tankerkönig: Sorte und Empfänger wählen, Sensoren und Automation werden angelegt |
 

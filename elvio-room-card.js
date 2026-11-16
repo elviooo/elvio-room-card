@@ -66,6 +66,44 @@ const SETUP_MA_SLUG = "d5369777_music_assistant";
 const SETUP_MA_STORE = "https://github.com/music-assistant/home-assistant-addon";
 // Ein Stand für alle Ansichten: sonst fragt jede Ansicht HACS und Supervisor neu.
 let setupCache = null;
+// Energie-Seite: Einstellungen von HA-Energie für alle Karten gemeinsam (eine Abfrage statt
+// einer je Ansicht), alle 10 Minuten neu; Summen und Verlauf bei offener Seite alle 5 Minuten.
+const ENERGY_PREFS_TTL_MS = 10 * 60 * 1000;
+const ENERGY_REFRESH_MS = 5 * 60 * 1000;
+const ENERGY_PERIODS = [
+  { key: "day", label: "Heute" },
+  { key: "week", label: "Woche" },
+  { key: "month", label: "Monat" },
+  { key: "year", label: "Jahr" },
+];
+// Farben im Verlauf (dunkle Fläche, mit dem Farb-Prüfer der Diagramm-Regeln geprüft):
+// Bezug blau, Einspeisung türkis, Solar orange – wie die Gewohnheit aus HA-Energie.
+const ENERGY_COLORS = { gridIn: "#3987e5", gridOut: "#199e70", solar: "#d95926", used: "#3987e5" };
+let energyCache = null;
+
+function loadEnergyPrefs(hass, force) {
+  if (!force && energyCache && Date.now() - energyCache.at < ENERGY_PREFS_TTL_MS) return energyCache.promise;
+  // Ohne Einstellungen antwortet HA mit einem Fehler („No prefs“) – das heißt schlicht „leer“.
+  const promise = hass
+    .callWS({ type: "energy/get_prefs" })
+    .catch(() => null)
+    .then((prefs) => ElvioEnergy.normalize(prefs));
+  energyCache = { at: Date.now(), promise };
+  return promise;
+}
+
+function fmtWatt(w) {
+  const a = Math.abs(w);
+  return a < 1000 ? `${Math.round(a)} W` : `${(a / 1000).toLocaleString("de-DE", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} kW`;
+}
+
+function fmtKwh(k) {
+  if (k == null || !Number.isFinite(k)) return "–";
+  // Kleine Mengen (ein Licht am Tag) nicht als „0,0“: unter 1 kWh zwei Stellen.
+  const a = Math.abs(k);
+  const digits = a === 0 ? 0 : a < 1 ? 2 : a < 10 ? 1 : 0;
+  return `${k.toLocaleString("de-DE", { minimumFractionDigits: digits, maximumFractionDigits: digits })} kWh`;
+}
 let setupRunning = null;
 const FUEL_KINDS = [
   { key: "e5", label: "Super E5" },
@@ -638,6 +676,255 @@ const ElvioRooms = {
   },
 };
 
+// ───────────── Energie (aus den Energie-Einstellungen von Home Assistant) ─────────────
+// Reine Rechnungen für die Energie-Seite; die Karte holt Einstellungen, Statistik und
+// Zustände und gibt sie hier hinein. Getestet in test/energy.test.mjs.
+
+const ElvioEnergy = {
+  // Einstellungen von HA-Energie (energy/get_prefs) in eine feste Form bringen. Beide Formen
+  // des Netzanschlusses werden verstanden: alt (flow_from/flow_to-Listen) und neu (ein Objekt
+  // mit stat_energy_from/stat_energy_to). Leistungen als { plus, minus }: Netz + Bezug,
+  // − Einspeisung; Batterie + Entladen, − Laden.
+  normalize(prefs) {
+    const n = {
+      gridIn: [], gridOut: [], solar: [], batteryIn: [], batteryOut: [], home: [], cost: [], compensation: [],
+      rates: { grid: [], solar: [], battery: [], home: [] },
+      devices: [],
+    };
+    const add = (list, id) => {
+      if (id && !list.includes(id)) list.push(id);
+    };
+    for (const s of (prefs && prefs.energy_sources) || []) {
+      if (s.type === "grid") {
+        add(n.gridIn, s.stat_energy_from);
+        add(n.gridOut, s.stat_energy_to);
+        add(n.cost, s.stat_cost);
+        add(n.compensation, s.stat_compensation);
+        for (const f of s.flow_from || []) {
+          add(n.gridIn, f.stat_energy_from);
+          add(n.cost, f.stat_cost);
+        }
+        for (const f of s.flow_to || []) {
+          add(n.gridOut, f.stat_energy_to);
+          add(n.compensation, f.stat_compensation);
+        }
+        const r = ElvioEnergy.rateOf(s);
+        if (r) n.rates.grid.push(r);
+        for (const p of s.power || []) if (p && p.stat_rate) n.rates.grid.push({ plus: [p.stat_rate], minus: [] });
+      } else if (s.type === "solar") {
+        add(n.solar, s.stat_energy_from);
+        if (s.stat_rate) n.rates.solar.push({ plus: [s.stat_rate], minus: [] });
+      } else if (s.type === "battery") {
+        add(n.batteryOut, s.stat_energy_from);
+        add(n.batteryIn, s.stat_energy_to);
+        add(n.batteryIn, s.stat_energy_from_grid);
+        add(n.batteryIn, s.stat_energy_from_solar);
+        add(n.batteryOut, s.stat_energy_to_home);
+        add(n.batteryOut, s.stat_energy_to_grid);
+        const r = ElvioEnergy.rateOf(s);
+        if (r) n.rates.battery.push(r);
+      } else if (s.type === "home") {
+        add(n.home, s.stat_energy_to);
+        if (s.stat_rate) n.rates.home.push({ plus: [s.stat_rate], minus: [] });
+      }
+    }
+    for (const d of (prefs && prefs.device_consumption) || []) {
+      if (!d || !d.stat_consumption) continue;
+      n.devices.push({ stat: d.stat_consumption, rate: d.stat_rate || null, name: d.name || null, includedIn: d.included_in_stat || null });
+    }
+    return n;
+  },
+
+  // Leistung eines Anschlusses. Die echten Sensoren aus power_config gehen vor; stat_rate
+  // allein kann eine von HA errechnete Statistik ohne Live-Zustand sein.
+  rateOf(s) {
+    const pc = s.power_config;
+    if (pc) {
+      const plus = [pc.stat_rate, pc.stat_rate_from, pc.stat_rate_to_home, pc.stat_rate_to_grid].filter(Boolean);
+      const minus = [pc.stat_rate_inverted, pc.stat_rate_to, pc.stat_rate_from_grid, pc.stat_rate_from_solar].filter(Boolean);
+      if (plus.length || minus.length) return { plus, minus };
+    }
+    return s.stat_rate ? { plus: [s.stat_rate], minus: [] } : null;
+  },
+
+  hasData(n) {
+    return !!(n.gridIn.length || n.gridOut.length || n.solar.length || n.batteryIn.length || n.batteryOut.length || n.home.length || n.devices.length);
+  },
+
+  // Leistung jetzt in Watt. watts(id) liefert Watt oder null. Den Hausverbrauch ergibt erst
+  // das Netz (es gleicht alles aus); ohne Netz-Leistung bleibt er offen, statt zu raten.
+  live(n, watts) {
+    const val = (specs) => {
+      let v = null;
+      for (const r of specs) {
+        for (const id of r.plus) {
+          const w = watts(id);
+          if (w != null) v = (v || 0) + w;
+        }
+        for (const id of r.minus) {
+          const w = watts(id);
+          if (w != null) v = (v || 0) - w;
+        }
+      }
+      return v;
+    };
+    const solar = val(n.rates.solar);
+    const grid = val(n.rates.grid);
+    const battery = val(n.rates.battery);
+    let home = val(n.rates.home);
+    if (home == null && grid != null) home = Math.max(0, (solar || 0) + grid + (battery || 0));
+    return { solar, grid, battery, home };
+  },
+
+  // Zeitraum in Ortszeit: Heute (Stunden), Woche ab Montag (Tage), Monat (Tage), Jahr (Monate).
+  periodRange(period, now) {
+    const d = new Date(now);
+    let start;
+    let end;
+    let bucket = "day";
+    if (period === "week") {
+      const back = (d.getDay() + 6) % 7;
+      start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - back);
+      end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 7);
+    } else if (period === "month") {
+      start = new Date(d.getFullYear(), d.getMonth(), 1);
+      end = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+    } else if (period === "year") {
+      start = new Date(d.getFullYear(), 0, 1);
+      end = new Date(d.getFullYear() + 1, 0, 1);
+      bucket = "month";
+    } else {
+      start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+      bucket = "hour";
+    }
+    return { period, start: start.getTime(), end: end.getTime(), bucket };
+  },
+
+  // Beginn jedes Balkens im Zeitraum (Sommerzeit: der Tag hat dann 23 bzw. 25 Stunden).
+  buckets(range) {
+    const out = [];
+    const s = new Date(range.start);
+    for (let i = 0; i < 400; i++) {
+      const t =
+        range.bucket === "hour"
+          ? new Date(s.getFullYear(), s.getMonth(), s.getDate(), s.getHours() + i)
+          : range.bucket === "month"
+            ? new Date(s.getFullYear(), s.getMonth() + i, 1)
+            : new Date(s.getFullYear(), s.getMonth(), s.getDate() + i);
+      if (t.getTime() >= range.end) break;
+      out.push(t.getTime());
+    }
+    return out;
+  },
+
+  // Summen im Zeitraum. change(id) liefert kWh oder null. Hausverbrauch wie in HA:
+  // Bezug + Solar + Entladen − Einspeisung − Laden (oder der eigene Hauszähler).
+  totals(n, change) {
+    const sum = (ids) => {
+      let v = null;
+      for (const id of ids) {
+        const c = change(id);
+        if (c != null) v = (v || 0) + c;
+      }
+      return v;
+    };
+    const clamp = (x) => Math.min(1, Math.max(0, x));
+    const t = {
+      gridIn: sum(n.gridIn),
+      gridOut: sum(n.gridOut),
+      solar: sum(n.solar),
+      batteryIn: sum(n.batteryIn),
+      batteryOut: sum(n.batteryOut),
+      cost: sum(n.cost),
+      compensation: sum(n.compensation),
+    };
+    const meter = sum(n.home);
+    const anySource = t.gridIn != null || t.solar != null || t.batteryOut != null;
+    t.home = meter != null
+      ? meter
+      : anySource
+        ? Math.max(0, (t.gridIn || 0) + (t.solar || 0) + (t.batteryOut || 0) - (t.gridOut || 0) - (t.batteryIn || 0))
+        : null;
+    t.autarky = t.home > 0 && t.gridIn != null ? clamp(1 - t.gridIn / t.home) : null;
+    t.selfUse = t.solar > 0 ? clamp(1 - (t.gridOut || 0) / t.solar) : null;
+    return t;
+  },
+
+  // Verlauf: je Balken Bezug, Einspeisung, Solar (kWh). stats wie recorder/statistics_during_period
+  // ({ id: [{ start, change }] }); fehlende Stunden zählen 0.
+  series(n, stats, buckets) {
+    const rows = buckets.map((t) => ({ t, gridIn: 0, gridOut: 0, solar: 0, used: 0 }));
+    const idx = (start) => {
+      for (let i = buckets.length - 1; i >= 0; i--) if (start >= buckets[i]) return i;
+      return -1;
+    };
+    const addAll = (ids, key) => {
+      for (const id of ids) {
+        for (const p of (stats && stats[id]) || []) {
+          const i = idx(typeof p.start === "number" ? p.start : Date.parse(p.start));
+          if (i >= 0 && Number.isFinite(p.change)) rows[i][key] += p.change;
+        }
+      }
+    };
+    addAll(n.gridIn, "gridIn");
+    addAll(n.gridOut, "gridOut");
+    addAll(n.solar, "solar");
+    // Verbrauch der eingetragenen Geräte (ohne die, die in einem anderen schon stecken) –
+    // Verlauf für Anlagen, die noch keinen Netzzähler haben.
+    addAll(n.devices.filter((d) => !d.includedIn).map((d) => d.stat), "used");
+    for (const r of rows) for (const k of ["gridIn", "gridOut", "solar", "used"]) r[k] = Math.round(r[k] * 1000) / 1000;
+    return rows;
+  },
+
+  // Verbraucher nach Verbrauch im Zeitraum (ohne Wert ans Ende), mit Leistung jetzt.
+  ranking(n, change, watts, nameOf) {
+    return n.devices
+      .map((d) => ({ stat: d.stat, name: d.name || nameOf(d.stat), kwh: change(d.stat), w: d.rate ? watts(d.rate) : null }))
+      .sort((a, b) => (b.kwh == null ? -1 : b.kwh) - (a.kwh == null ? -1 : a.kwh));
+  },
+
+  // Für „Energie einrichten“: Energiezähler einzelner Verbraucher (z. B. Shelly-Kanäle), mit
+  // der Leistung desselben Geräts für den Live-Wert. Draußen bleiben: Einspeise-Zähler,
+  // Reserven, Versteckt/Technik, schon Eingetragenes und die Summe eines Geräts, dessen
+  // Kanäle eigene Zähler haben (sonst zählte alles doppelt).
+  consumerCandidates({ entities, states, devices, existing }) {
+    const isEnergy = (e) => {
+      const st = states[e.entity_id];
+      const a = (st && st.attributes) || {};
+      return e.entity_id.startsWith("sensor.") && a.device_class === "energy" && ["total_increasing", "total"].includes(a.state_class);
+    };
+    const visible = (entities || []).filter((e) => !e.hidden && !e.entity_category && !e.disabled_by);
+    const energy = visible.filter(isEnergy);
+    const parents = new Set(
+      energy.map((e) => devices[e.device_id]).filter((d) => d && d.via_device_id).map((d) => d.via_device_id),
+    );
+    const out = [];
+    for (const e of energy) {
+      const dev = devices[e.device_id];
+      if (!dev || parents.has(dev.id)) continue;
+      const name = dev.name_by_user || dev.name || "";
+      const label = `${e.entity_id} ${(states[e.entity_id].attributes || {}).friendly_name || ""}`;
+      if (!name || /^reserve/i.test(name)) continue;
+      if (/einspeis|r(ue|ü)ckspeis|returned|export/i.test(label)) continue;
+      if ((existing || []).includes(e.entity_id)) continue;
+      const power = visible.filter((p) => {
+        const a = (states[p.entity_id] && states[p.entity_id].attributes) || {};
+        return p.device_id === e.device_id && p.entity_id.startsWith("sensor.") && a.device_class === "power";
+      });
+      const common = (x) => {
+        let i = 0;
+        while (i < x.length && x[i] === e.entity_id[i]) i++;
+        return i;
+      };
+      power.sort((x, y) => common(y.entity_id) - common(x.entity_id));
+      out.push({ stat_consumption: e.entity_id, stat_rate: power.length ? power[0].entity_id : undefined, name });
+    }
+    for (const o of out) if (!o.stat_rate) delete o.stat_rate;
+    return out.sort((a, b) => a.name.localeCompare(b.name, "de"));
+  },
+};
+
 // ───────────── Gegensprechen über SIP Core ─────────────
 // SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
 // Änderung als Ereignis „sipcore-update“ am window. Benutzt werden nur: callState
@@ -931,6 +1218,7 @@ class ElvioRoomCard extends HTMLElement {
   set hass(hass) {
     const prev = this._hass;
     this._hass = hass;
+    if (this._config && (!this._energyAt || Date.now() - this._energyAt > ENERGY_PREFS_TTL_MS)) this._ensureEnergy();
     // Geräte, Räume oder Labels geändert (Kunde hat etwas gekoppelt oder am Tablet
     // ein-/ausgeblendet): Ansicht neu zusammenstellen. Nur dann – Zustandsänderungen
     // tauschen diese Objekte nicht aus.
@@ -977,11 +1265,13 @@ class ElvioRoomCard extends HTMLElement {
     const adding = open && this._editMode === "add" && !!this._addState;
     const roomForm = open && this._editMode === "room" && !!this._roomDraft;
     const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
+    const energyOpen = this._energyWrap && !this._energyWrap.hidden;
     this._build(true);
     this._update();
     this._scroller.scrollTop = top;
     if (editing) this._openEdit();
     if (adding) this._showAdd();
+    if (energyOpen) this._openEnergy(true);
     // Raumübersicht (auch im Bearbeiten-Modus) und Raum-Blatt mit Entwurf bleiben offen.
     if (roomsOpen) {
       this._roomsNavWrap.hidden = false;
@@ -1228,6 +1518,9 @@ class ElvioRoomCard extends HTMLElement {
   }
 
   disconnectedCallback() {
+    // Wer die Ansicht verlässt und zurückkommt, sieht wieder die Ansicht, nicht die Energie-Seite.
+    this._closeEnergy();
+    clearInterval(this._energyTimer);
     clearInterval(this._clockTimer);
     clearInterval(this._cameraTimer);
     clearInterval(this._progressTimer);
@@ -1251,6 +1544,7 @@ class ElvioRoomCard extends HTMLElement {
     root.appendChild(el("style", "", STYLE));
 
     const frame = el("div", "frame");
+    this._frame = frame;
     frame.lang = "de"; // Silbentrennung für zweizeilige Namen („Bewegungs-licht“)
     this._bg = el("div", "bg");
     this._bgImg = el("img", "bg-img");
@@ -1279,11 +1573,13 @@ class ElvioRoomCard extends HTMLElement {
     // Navigation: Räume (room: true) stehen nicht einzeln in der Leiste, sondern hinter
     // einem Eintrag „Räume“ – so bleibt es bei fünf Einträgen, egal wie viele Räume.
     const navItems = this._navItems();
+    this._navEls = [];
     const nav = el("nav", "top");
     for (const item of navItems) {
       const link = el("button", "link", item.name);
       if (item.active) link.classList.add("active");
-      link.addEventListener("click", () => (item.rooms ? this._openRoomsNav() : this._navigate(item.path)));
+      this._navEls.push({ item, node: link });
+      link.addEventListener("click", () => this._navClick(item));
       nav.appendChild(link);
     }
     this._clock = el("div", "clock");
@@ -1351,42 +1647,9 @@ class ElvioRoomCard extends HTMLElement {
       }
       scroller.appendChild(list);
     }
-    // Magnet: zwei Ruhelagen (Ansicht | Anfang der Steuerung). Eingerastet wird nur im
-    // Bereich dazwischen, in Wischrichtung; innerhalb der Steuerung scrollt man frei bis
-    // ganz unten. (CSS scroll-snap zog die hohe Steuerung immer wieder an ihren Anfang.)
-    // --p (0…1) folgt dem Finger und treibt alle Übergänge.
-    let raf = 0;
-    let settled = 0;
-    let idle = 0;
-    const snap = () => {
-      const h = screen.offsetHeight;
-      const t = scroller.scrollTop;
-      if (t <= 1 || t >= h - 1) {
-        settled = t <= 1 ? 0 : h;
-        return;
-      }
-      const goingDown = t > settled;
-      const target = goingDown ? (t > h * SNAP_THRESHOLD ? h : 0) : t < h * (1 - SNAP_THRESHOLD) ? 0 : h;
-      settled = target;
-      scroller.scrollTo({ top: target, behavior: "smooth" });
-    };
-    scroller.addEventListener(
-      "scroll",
-      () => {
-        clearTimeout(idle);
-        idle = setTimeout(snap, SNAP_IDLE_MS);
-        if (raf) return;
-        raf = requestAnimationFrame(() => {
-          raf = 0;
-          const p = Math.min(1, Math.max(0, scroller.scrollTop / (screen.offsetHeight * 0.7)));
-          frame.style.setProperty("--p", p.toFixed(3));
-          frame.classList.toggle("scrolled", scroller.scrollTop > 24);
-        });
-      },
-      { passive: true },
-    );
+    this._wireScroll(frame, scroller, screen);
 
-    const main = [scroller];
+    const main = [scroller, this._buildEnergy(frame)];
 
     // Leiste unten (nur Handy)
     const tabbar = el("nav", "tabbar");
@@ -1397,7 +1660,8 @@ class ElvioRoomCard extends HTMLElement {
       b.appendChild(icon(item.icon || "mdi:circle-outline"));
       b.appendChild(el("span", "tab-label", item.name));
       if (item.active) b.classList.add("active");
-      b.addEventListener("click", () => (item.rooms ? this._openRoomsNav() : this._navigate(item.path)));
+      this._navEls.push({ item, node: b });
+      b.addEventListener("click", () => this._navClick(item));
       tabbar.appendChild(b);
     }
 
@@ -1454,6 +1718,44 @@ class ElvioRoomCard extends HTMLElement {
     } else {
       for (const sec of frame.querySelectorAll(".section")) sec.classList.add("in");
     }
+  }
+
+  // Magnet und Übergänge (--p) eines Scrollers; die Energie-Seite nutzt dasselbe Verhalten.
+  _wireScroll(frame, scroller, screen) {
+    // Magnet: zwei Ruhelagen (Ansicht | Anfang der Steuerung). Eingerastet wird nur im
+    // Bereich dazwischen, in Wischrichtung; innerhalb der Steuerung scrollt man frei bis
+    // ganz unten. (CSS scroll-snap zog die hohe Steuerung immer wieder an ihren Anfang.)
+    // --p (0…1) folgt dem Finger und treibt alle Übergänge.
+    let raf = 0;
+    let settled = 0;
+    let idle = 0;
+    const snap = () => {
+      const h = screen.offsetHeight;
+      const t = scroller.scrollTop;
+      if (t <= 1 || t >= h - 1) {
+        settled = t <= 1 ? 0 : h;
+        return;
+      }
+      const goingDown = t > settled;
+      const target = goingDown ? (t > h * SNAP_THRESHOLD ? h : 0) : t < h * (1 - SNAP_THRESHOLD) ? 0 : h;
+      settled = target;
+      scroller.scrollTo({ top: target, behavior: "smooth" });
+    };
+    scroller.addEventListener(
+      "scroll",
+      () => {
+        clearTimeout(idle);
+        idle = setTimeout(snap, SNAP_IDLE_MS);
+        if (raf) return;
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          const p = Math.min(1, Math.max(0, scroller.scrollTop / (screen.offsetHeight * 0.7)));
+          frame.style.setProperty("--p", p.toFixed(3));
+          frame.classList.toggle("scrolled", scroller.scrollTop > 24);
+        });
+      },
+      { passive: true },
+    );
   }
 
   _buildTileGrid(cfgs) {
@@ -1750,9 +2052,20 @@ class ElvioRoomCard extends HTMLElement {
         const big = el("button", "en-big");
         tile.enSolar = el("div", "en-value");
         big.append(icon("mdi:solar-power-variant-outline"), tile.enSolar, el("div", "en-label", "Solar jetzt"));
-        big.addEventListener("click", () => this._moreInfo(cfg.solar));
+        // Mit HA-Energie öffnet ein Tipp die Energie-Seite, sonst wie bisher den Solar-Verlauf.
+        big.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (this._energyNav) this._openEnergy();
+          else this._moreInfo(cfg.solar);
+        });
+        node.addEventListener("click", () => {
+          if (this._energyNav) this._openEnergy();
+        });
         tile.enPrice = el("button", "en-price");
-        tile.enPrice.addEventListener("click", () => this._moreInfo(cfg.price));
+        tile.enPrice.addEventListener("click", (e) => {
+          e.stopPropagation();
+          this._moreInfo(cfg.price);
+        });
         head.append(big, tile.enPrice);
         tile.enStats = el("div", "en-stats");
         node.append(head, tile.enStats);
@@ -1878,6 +2191,7 @@ class ElvioRoomCard extends HTMLElement {
     this._renderPlayer();
     this._renderLights();
     this._renderRoomsNav();
+    this._renderEnergyLive();
   }
 
   _updateBackground() {
@@ -2760,6 +3074,41 @@ class ElvioRoomCard extends HTMLElement {
         done: have,
         form: true,
       });
+    }
+
+    // Energie: Verbraucher mit eigenem Energiezähler (z. B. Shelly-Kanäle) in HA-Energie
+    // eintragen. Netzzähler und Solar nicht – dafür braucht es das passende Gerät.
+    if (comps.includes("energy")) {
+      const prefs = await ws({ type: "energy/get_prefs" }).catch(() => null);
+      const cands = this._energyCandidates(prefs);
+      const have = ElvioEnergy.normalize(prefs).devices.length;
+      if (cands.length || have) {
+        const names = cands.slice(0, 3).map((c) => c.name).join(", ");
+        items.push({
+          id: "energy",
+          icon: "mdi:lightning-bolt-outline",
+          name: "Energie einrichten",
+          sub: cands.length
+            ? `${cands.length} Verbraucher in HA-Energie eintragen (${names}${cands.length > 3 ? " …" : ""}) – für die Seite „Energie“`
+            : `${have} Verbraucher eingetragen`,
+          done: !cands.length,
+          run: async (step) => {
+            step("Trage Verbraucher ein …");
+            const now = await ws({ type: "energy/get_prefs" }).catch(() => null);
+            const add = this._energyCandidates(now);
+            const keep = (now && now.device_consumption) || [];
+            try {
+              await ws({ type: "energy/save_prefs", device_consumption: [...keep, ...add] });
+            } catch (err) {
+              // Ältere HA-Versionen kennen die Leistung je Verbraucher (stat_rate) noch nicht.
+              if (!/stat_rate|extra keys/i.test(String((err && err.message) || err))) throw err;
+              await ws({ type: "energy/save_prefs", device_consumption: [...keep, ...add.map(({ stat_rate, ...d }) => d)] });
+            }
+            energyCache = null;
+            this._ensureEnergy(true);
+          },
+        });
+      }
     }
 
     // Altes Dashboard (Räume in nav): auf Räume aus HA umstellen. Prüft vor jedem Schreiben,
@@ -4304,7 +4653,7 @@ class ElvioRoomCard extends HTMLElement {
       if (all.length && this._rooms().length) {
         items.splice(Math.min(1, items.length), 0, { name: "Räume", icon: "mdi:floor-plan", rooms: true, active: this._isCurrent(base) });
       }
-      return items;
+      return this._withEnergy(items);
     }
     const rooms = all.filter((i) => i.room);
     const items = [];
@@ -4325,7 +4674,567 @@ class ElvioRoomCard extends HTMLElement {
       }
       items.push({ ...item, active: this._isCurrent(item.path) });
     }
+    return this._withEnergy(items);
+  }
+
+  // „Energie“ hinter „Räume“ (sonst hinter dem ersten Eintrag) – nur, wenn in HA-Energie
+  // etwas eingetragen ist, und nur in Karten mit Leiste.
+  _withEnergy(items) {
+    if (!this._energyNav || !items.length) return items;
+    const i = items.findIndex((x) => x.rooms);
+    items.splice(i >= 0 ? i + 1 : Math.min(1, items.length), 0, { name: "Energie", icon: "mdi:lightning-bolt-outline", energy: true, active: false });
     return items;
+  }
+
+  _navClick(item) {
+    if (item.energy) {
+      this._openEnergy();
+      return;
+    }
+    // Jeder andere Eintrag verlässt die Energie-Seite – auch der der eigenen Ansicht.
+    this._closeEnergy();
+    if (item.rooms) this._openRoomsNav();
+    else this._navigate(item.path);
+  }
+
+  _markNav() {
+    const on = !!(this._energyWrap && !this._energyWrap.hidden);
+    for (const { item, node } of this._navEls || []) node.classList.toggle("active", on ? !!item.energy : !!item.active);
+  }
+
+
+
+  // ───────────── Energie-Seite ─────────────
+  // Liest, was in HA-Energie eingetragen ist; jeder Teil erscheint nur mit Daten. Nur Anzeige.
+
+  _ensureEnergy(force) {
+    this._energyAt = Date.now();
+    loadEnergyPrefs(this._hass, force).then((n) => this._applyEnergy(n), () => {});
+  }
+
+  // Neuer Stand aus HA-Energie: „Energie“ in der Leiste erscheint bzw. verschwindet sofort.
+  _applyEnergy(n) {
+    this._energyN = n;
+    const has = ElvioEnergy.hasData(n);
+    if (has === !!this._energyNav) return;
+    this._energyNav = has;
+    if (this._built && (this._config.nav || []).length) this._rebuildKeepingPlace();
+  }
+
+  _energyCandidates(prefs) {
+    const hass = this._hass;
+    const n = ElvioEnergy.normalize(prefs);
+    const existing = [
+      ...n.devices.map((d) => d.stat), ...n.gridIn, ...n.gridOut, ...n.solar, ...n.batteryIn, ...n.batteryOut, ...n.home,
+    ];
+    return ElvioEnergy.consumerCandidates({ entities: Object.values(hass.entities || {}), states: hass.states, devices: hass.devices || {}, existing });
+  }
+
+  // Die Energie-Seite ist eine eigene „Ansicht“ in der Karte: Kopfzeile und Hintergrund
+  // bleiben, statt Titel und Kacheln der Ansicht stehen dort „Energie“ und ihre Kacheln – im
+  // selben Aufbau (erster Bildschirm, darunter „Mehr“). Ein anderer Leisten-Eintrag schaltet zurück.
+  _buildEnergy(frame) {
+    const scroller = el("div", "scroller escroller");
+    scroller.hidden = true;
+    const screen = el("section", "screen");
+    const hero = el("section", "hero");
+    this._energyStatus = el("div", "status");
+    const chips = el("div", "chips eperiods");
+    for (const p of ENERGY_PERIODS) {
+      const chip = el("button", "chip eper", p.label);
+      chip.dataset.key = p.key;
+      chip.addEventListener("click", () => {
+        if (this._energyPeriod === p.key) return;
+        this._energyPeriod = p.key;
+        this._renderEnergy();
+        this._loadEnergyData();
+      });
+      chips.appendChild(chip);
+    }
+    this._energyChips = chips;
+    hero.append(this._energyStatus, el("h1", "", "Energie"), chips);
+    this._energyMsg = el("div", "emsg");
+    this._energyMsg.hidden = true;
+    this._energyFirst = el("div", "tiles");
+    const more = el("button", "more");
+    more.append(icon("mdi:chevron-down"), document.createTextNode("Mehr"));
+    more.addEventListener("click", () => scroller.scrollTo({ top: screen.offsetHeight, behavior: "smooth" }));
+    this._energyMore = more;
+    screen.append(hero, this._energyMsg, this._energyFirst, more);
+    this._energySections = el("div", "sections");
+    scroller.append(screen, this._energySections);
+    this._wireScroll(frame, scroller, screen);
+    this._energyWrap = scroller;
+    return scroller;
+  }
+
+  _openEnergy(keep = false) {
+    if (!this._energyWrap) return;
+    const wasOpen = !this._energyWrap.hidden;
+    this._energyWrap.hidden = false;
+    this._scroller.hidden = true;
+    if (this._roomsNavWrap) this._roomsNavWrap.hidden = true;
+    if (!wasOpen) {
+      this._energyShown = new Set();
+      this._energyWrap.scrollTop = 0;
+      this._frame.style.setProperty("--p", "0");
+      this._frame.classList.remove("scrolled");
+      this._energyConsAll = false;
+    }
+    this._markNav();
+    this._energyPeriod = this._energyPeriod || "day";
+    this._energyMsg.hidden = true;
+    clearInterval(this._energyTimer);
+    this._energyTimer = setInterval(() => this._loadEnergyData(), ENERGY_REFRESH_MS);
+    this._renderEnergy();
+    if (keep && this._energyN) {
+      this._loadEnergyData();
+      return;
+    }
+    loadEnergyPrefs(this._hass, true).then(
+      (n) => {
+        this._applyEnergy(n);
+        this._renderEnergy();
+        this._loadEnergyData();
+      },
+      (err) => this._energyError(err),
+    );
+  }
+
+  _closeEnergy() {
+    if (!this._energyWrap || this._energyWrap.hidden) return;
+    this._energyWrap.hidden = true;
+    this._scroller.hidden = false;
+    clearInterval(this._energyTimer);
+    this._markNav();
+    // Übergänge wieder nach dem Stand der Ansicht.
+    this._scroller.dispatchEvent(new Event("scroll"));
+  }
+
+  _energyError(err) {
+    this._energyMsg.textContent = `Energie nicht geladen: ${(err && err.message) || err}`;
+    this._energyMsg.hidden = false;
+  }
+
+  // Summen (statistic_during_period, genau bis jetzt) und Verlauf (statistics_during_period,
+  // je Stunde/Tag/Monat) für den gewählten Zeitraum. Ein späteres Laden gewinnt.
+  async _loadEnergyData() {
+    const n = this._energyN;
+    if (!n || !this._energyWrap || this._energyWrap.hidden || !ElvioEnergy.hasData(n)) return;
+    const hass = this._hass;
+    const period = this._energyPeriod;
+    const range = ElvioEnergy.periodRange(period, Date.now());
+    const buckets = ElvioEnergy.buckets(range);
+    const token = (this._energyToken = (this._energyToken || 0) + 1);
+    const span = { start_time: new Date(range.start).toISOString(), end_time: new Date(range.end).toISOString() };
+    const units = { energy: "kWh" };
+    const ids = [...new Set([
+      ...n.gridIn, ...n.gridOut, ...n.solar, ...n.batteryIn, ...n.batteryOut, ...n.home, ...n.cost, ...n.compensation,
+      ...n.devices.map((d) => d.stat),
+    ])];
+    const seriesIds = [...new Set([...n.gridIn, ...n.gridOut, ...n.solar, ...n.devices.filter((d) => !d.includedIn).map((d) => d.stat)])];
+    try {
+      const changes = {};
+      await Promise.all(
+        ids.map((id) =>
+          hass
+            .callWS({ type: "recorder/statistic_during_period", statistic_id: id, fixed_period: span, types: ["change"], units })
+            .then(
+              (r) => (changes[id] = r && Number.isFinite(r.change) ? r.change : null),
+              () => (changes[id] = null),
+            ),
+        ),
+      );
+      const stats = seriesIds.length
+        ? await hass.callWS({ type: "recorder/statistics_during_period", ...span, statistic_ids: seriesIds, period: range.bucket, types: ["change"], units })
+        : {};
+      if (token !== this._energyToken) return;
+      this._energyData = { period, range, buckets, changes, stats };
+      this._energyMsg.hidden = true;
+      this._renderEnergy();
+    } catch (err) {
+      if (token === this._energyToken) this._energyError(err);
+    }
+  }
+
+  _renderEnergy() {
+    if (!this._energyWrap || this._energyWrap.hidden) return;
+    for (const c of this._energyChips.children) c.classList.toggle("active", c.dataset.key === this._energyPeriod);
+    const first = this._energyFirst;
+    const secs = this._energySections;
+    first.innerHTML = "";
+    secs.innerHTML = "";
+    this._energyFlow = null;
+    this._energyConsW = [];
+    this._energyNowVal = null;
+    const row = (nodes) => {
+      const units = nodes.reduce((a, x) => a + (Number(x.style.getPropertyValue("--span")) || 1), 0);
+      first.style.setProperty("--cols", String(Math.max(1, Math.min(4, units))));
+      nodes.forEach((x, i) => x.style.setProperty("--i", String(i)));
+      first.append(...nodes);
+    };
+    const n = this._energyN;
+    if (!n || !ElvioEnergy.hasData(n)) {
+      const note = this._energyNote(n ? "In Home Assistant ist noch keine Energie eingetragen (Einstellungen → Dashboards → Energie)." : "Wird geladen …");
+      if (n && this._isAdmin()) {
+        const b = pillButton("mdi:auto-fix", "Einrichtung öffnen");
+        b.addEventListener("click", () => this._openSetup());
+        note.appendChild(b);
+      }
+      row([note]);
+      this._energyMore.hidden = true;
+      this._energyStatus.textContent = "";
+      return;
+    }
+    const r = n.rates;
+    const hasFlow = !!(r.grid.length || r.solar.length || r.battery.length || r.home.length);
+    const d = this._energyData;
+    const ready = !!(d && d.period === this._energyPeriod);
+    const change = (id) => (ready && id in d.changes ? d.changes[id] : null);
+    const t = ready ? ElvioEnergy.totals(n, change) : null;
+    const rank = ready ? ElvioEnergy.ranking(n, change, (id) => this._watts(id), (id) => this._friendly(id)) : [];
+    const totals = ready ? this._energyTotalTiles(n, t, rank) : [];
+    const firstRow = [];
+    if (hasFlow) {
+      const ft = el("div", "tile eflowtile");
+      ft.style.setProperty("--span", "2");
+      ft.appendChild(this._energyFlowNode(n));
+      firstRow.push(ft, ...totals.slice(0, 2));
+    } else if (ready) {
+      firstRow.push(...this._energyDeviceTiles(n, rank));
+    }
+    if (!ready) firstRow.push(this._energyNote("Werte werden geladen …"));
+    row(firstRow);
+    // Abschnitte blenden wie in den Ansichten beim Hineinscrollen ein – aber nur einmal je
+    // Öffnen; das Nachladen alle 5 Minuten lässt Sichtbares stehen.
+    const shown = (this._energyShown = this._energyShown || new Set());
+    const io =
+      "IntersectionObserver" in window
+        ? new IntersectionObserver(
+            (entries) => {
+              for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                e.target.classList.add("in");
+                shown.add(e.target.dataset.key);
+                io.unobserve(e.target);
+              }
+            },
+            { root: this._energyWrap, threshold: 0.15 },
+          )
+        : null;
+    const section = (title, content, key = title) => {
+      const b = el("section", "section");
+      b.dataset.key = key;
+      b.append(el("h2", "", title), content);
+      secs.appendChild(b);
+      if (shown.has(key)) b.classList.add("in", "shown");
+      else if (io) io.observe(b);
+      else b.classList.add("in");
+    };
+    if (ready) {
+      const rest = totals.slice(hasFlow ? 2 : 0);
+      if (hasFlow && rest.length) {
+        const g = el("div", "tiles");
+        g.style.setProperty("--cols", String(Math.min(4, rest.length)));
+        g.append(...rest);
+        section({ day: "Heute", week: "Diese Woche", month: "Dieser Monat", year: "Dieses Jahr" }[this._energyPeriod], g, "totals");
+      }
+      const chart = el("div", "tile ewide");
+      chart.appendChild(this._energyChartNode(n, ElvioEnergy.series(n, d.stats, d.buckets), d.range));
+      section("Verlauf", chart);
+      if (rank.length) {
+        const list = el("div", "tile ewide");
+        list.appendChild(this._energyConsumersNode(rank));
+        section("Verbraucher", list);
+      }
+    }
+    this._energyMore.hidden = !secs.children.length;
+    this._renderEnergyLive();
+  }
+
+  _energyNote(text) {
+    const note = el("div", "tile enote");
+    note.appendChild(el("div", "state", text));
+    return note;
+  }
+
+  // Kachel mit Bezeichnung, großem Wert und Zusatz – im Stil der übrigen Kacheln.
+  _energyTile(ic, label, value, sub, id) {
+    const node = el("div", "tile etot");
+    const text = el("div", "text");
+    const val = el("div", "etot-val", value);
+    text.append(el("div", "name", label), val, el("div", "state", sub || ""));
+    const i = el("div", "icon");
+    i.appendChild(icon(ic));
+    node.append(text, i);
+    if (id) node.addEventListener("click", () => this._moreInfo(id));
+    else node.classList.add("static");
+    return { node, val };
+  }
+
+  _energyTotalTiles(n, t, rank) {
+    const cur = (this._hass.config && this._hass.config.currency) || "EUR";
+    const money = (x) => (x == null ? null : x.toLocaleString("de-DE", { style: "currency", currency: cur }));
+    const pct = (x) => `${Math.round(x * 100)} %`;
+    const out = [];
+    const add = (...a) => out.push(this._energyTile(...a).node);
+    if (t.gridIn != null) add("mdi:transmission-tower-export", "Bezug", fmtKwh(t.gridIn), money(t.cost) || "aus dem Netz", n.gridIn[0]);
+    if (t.gridOut != null) add("mdi:transmission-tower-import", "Einspeisung", fmtKwh(t.gridOut), money(t.compensation) || "ins Netz", n.gridOut[0]);
+    if (t.solar != null) add("mdi:solar-power-variant-outline", "Solar", fmtKwh(t.solar), "erzeugt", n.solar[0]);
+    if (t.home != null) add("mdi:home-lightning-bolt-outline", "Verbrauch", fmtKwh(t.home), "im Haus", n.home[0]);
+    if (t.batteryIn != null || t.batteryOut != null) {
+      add("mdi:home-battery-outline", "Batterie", `${fmtKwh(t.batteryIn || 0)} rein`, `${fmtKwh(t.batteryOut || 0)} raus`, n.batteryIn[0] || n.batteryOut[0]);
+    }
+    if (t.autarky != null) add("mdi:shield-home-outline", "Autarkie", pct(t.autarky), "selbst versorgt");
+    if (t.selfUse != null) add("mdi:solar-power", "Eigenverbrauch", pct(t.selfUse), "Solarstrom selbst genutzt");
+    return out;
+  }
+
+  // Ohne Zähler (nur Verbraucher eingetragen): Verbrauch im Zeitraum, Leistung jetzt und
+  // der größte Verbraucher.
+  _energyDeviceTiles(n, rank) {
+    const top = n.devices.filter((d) => !d.includedIn).map((d) => d.stat);
+    const sum = rank.filter((x) => top.includes(x.stat) && x.kwh != null).reduce((a, x) => a + x.kwh, 0);
+    const word = { day: "heute", week: "diese Woche", month: "diesen Monat", year: "dieses Jahr" }[this._energyPeriod];
+    const out = [this._energyTile("mdi:counter", "Verbrauch", fmtKwh(sum), `${top.length} Geräte ${word}`).node];
+    if (n.devices.some((d) => d.rate)) {
+      const now = this._energyTile("mdi:flash-outline", "Jetzt", "–", "alle Verbraucher");
+      this._energyNowVal = now.val;
+      out.push(now.node);
+    }
+    const best = rank.find((x) => x.kwh > 0);
+    if (best) out.push(this._energyTile("mdi:trophy-outline", "Am meisten", fmtKwh(best.kwh), best.name, best.stat).node);
+    return out;
+  }
+
+  // Fluss jetzt: Haus in der Mitte, Solar oben, Netz links, Batterie rechts. Die Linien
+  // laufen in Richtung des Stroms.
+  _energyFlowNode(n) {
+    const r = n.rates;
+    const box = el("div", "eflow");
+    box.classList.toggle("nosolar", !r.solar.length);
+    const first = (specs) => (specs[0] && (specs[0].plus[0] || specs[0].minus[0])) || null;
+    const node = (key, ic, label, id) => {
+      const b = el("button", `enode ${key}`);
+      const c = el("div", "enode-ic");
+      c.appendChild(icon(ic));
+      const v = el("div", "enode-val", "–");
+      const sub = el("div", "enode-sub", label);
+      b.append(c, v, sub);
+      if (id) b.addEventListener("click", () => this._moreInfo(id));
+      box.appendChild(b);
+      return { b, v, sub };
+    };
+    const line = (key) => {
+      const l = el("div", `eline ${key}`);
+      box.appendChild(l);
+      return l;
+    };
+    const f = { home: node("home", "mdi:home-lightning-bolt-outline", "Haus", first(r.home)) };
+    if (r.solar.length) {
+      f.solar = node("solar", "mdi:solar-power-variant-outline", "Solar", first(r.solar));
+      f.solarLine = line("l-solar");
+    }
+    if (r.grid.length) {
+      f.grid = node("grid", "mdi:transmission-tower", "Netz", first(r.grid));
+      f.gridLine = line("l-grid");
+    }
+    if (r.battery.length) {
+      f.battery = node("battery", "mdi:home-battery-outline", "Batterie", first(r.battery));
+      f.batteryLine = line("l-battery");
+    }
+    this._energyFlow = f;
+    return box;
+  }
+
+  _renderEnergyLive() {
+    if (!this._energyWrap || this._energyWrap.hidden || !this._energyN) return;
+    const idle = 30;
+    const show = (w) => (w == null ? "–" : fmtWatt(w));
+    const f = this._energyFlow;
+    if (f) {
+      const live = ElvioEnergy.live(this._energyN, (id) => this._watts(id));
+      f.home.v.textContent = show(live.home);
+      if (f.solar) {
+        f.solar.v.textContent = show(live.solar);
+        f.solarLine.classList.toggle("on", (live.solar || 0) > idle);
+      }
+      if (f.grid) {
+        const g = live.grid;
+        const out = g != null && g < -idle;
+        const inn = g != null && g > idle;
+        f.grid.v.textContent = show(g == null ? null : Math.abs(g));
+        f.grid.sub.textContent = out ? "Einspeisung" : inn ? "Bezug" : "Netz";
+        f.grid.b.classList.toggle("out", out);
+        f.gridLine.classList.toggle("out", out);
+        f.gridLine.classList.toggle("on", out || inn);
+        f.gridLine.classList.toggle("rev", out);
+      }
+      if (f.battery) {
+        const b = live.battery;
+        const dis = b != null && b > idle;
+        const chg = b != null && b < -idle;
+        f.battery.v.textContent = show(b == null ? null : Math.abs(b));
+        f.battery.sub.textContent = dis ? "liefert" : chg ? "lädt" : "Batterie";
+        f.batteryLine.classList.toggle("on", dis || chg);
+        f.batteryLine.classList.toggle("rev", dis);
+      }
+    }
+    for (const c of this._energyConsW || []) {
+      const w = this._watts(c.rate);
+      c.node.textContent = w != null && w > 1 ? `jetzt ${fmtWatt(w)}` : "";
+    }
+    // Statuszeile über dem Titel wie in den Ansichten: was das Haus jetzt braucht.
+    const n = this._energyN;
+    let status = "";
+    if (n && ElvioEnergy.hasData(n)) {
+      const live = ElvioEnergy.live(n, (id) => this._watts(id));
+      let devW = null;
+      for (const d of n.devices) {
+        if (d.includedIn || !d.rate) continue;
+        const w = this._watts(d.rate);
+        if (w != null) devW = (devW || 0) + w;
+      }
+      if (live.home != null) status = `${fmtWatt(live.home)} im Haus`;
+      else if (devW != null) status = `${fmtWatt(devW)} jetzt`;
+      if (this._energyNowVal) this._energyNowVal.textContent = devW == null ? "–" : fmtWatt(devW);
+    }
+    this._energyStatus.textContent = status;
+  }
+
+  // Verlauf als Balken: Bezug nach oben, Einspeisung nach unten, Solar als Linie – eine Achse
+  // (alles kWh). Ohne Zähler: Verbrauch der Geräte. Antippen zeigt die Werte des Balkens.
+  _energyChartNode(n, rows, range) {
+    const wrap = el("div", "echart");
+    const series = (n.gridIn.length || n.gridOut.length || n.solar.length)
+      ? [
+          n.gridIn.length && { key: "gridIn", label: "Bezug", dir: 1 },
+          n.gridOut.length && { key: "gridOut", label: "Einspeisung", dir: -1 },
+          n.solar.length && { key: "solar", label: "Solar", line: true },
+        ].filter(Boolean)
+      : [{ key: "used", label: "Verbrauch", dir: 1 }];
+    const upKeys = series.filter((x) => x.dir === 1 || x.line).map((x) => x.key);
+    const up = Math.max(0, ...rows.flatMap((r) => upKeys.map((k) => r[k])));
+    const down = series.some((x) => x.dir === -1) ? Math.max(0, ...rows.map((r) => r.gridOut)) : 0;
+    if (up + down <= 0) {
+      wrap.appendChild(el("div", "ag-empty", "Noch keine Werte in diesem Zeitraum."));
+      return wrap;
+    }
+    const W = 720;
+    const H = 180;
+    const padT = 6;
+    const padB = 6;
+    const plot = H - padT - padB;
+    const scale = plot / (up + down);
+    const y0 = padT + up * scale;
+    const step = W / rows.length;
+    const bw = Math.max(2, Math.min(26, step * 0.6));
+    const r4 = (h) => Math.min(4, bw / 2, h);
+    const fx = (v) => v.toFixed(1);
+    let bars = "";
+    let hits = "";
+    rows.forEach((row, i) => {
+      const x = i * step + (step - bw) / 2;
+      for (const sr of series) {
+        if (sr.line) continue;
+        const h = row[sr.key] * scale;
+        if (h < 0.5) continue;
+        const r = r4(h);
+        const d = sr.dir === 1
+          ? `M${fx(x)},${fx(y0)}V${fx(y0 - h + r)}Q${fx(x)},${fx(y0 - h)} ${fx(x + r)},${fx(y0 - h)}H${fx(x + bw - r)}Q${fx(x + bw)},${fx(y0 - h)} ${fx(x + bw)},${fx(y0 - h + r)}V${fx(y0)}Z`
+          : `M${fx(x)},${fx(y0)}V${fx(y0 + h - r)}Q${fx(x)},${fx(y0 + h)} ${fx(x + r)},${fx(y0 + h)}H${fx(x + bw - r)}Q${fx(x + bw)},${fx(y0 + h)} ${fx(x + bw)},${fx(y0 + h - r)}V${fx(y0)}Z`;
+        bars += `<path d="${d}" fill="${ENERGY_COLORS[sr.key]}"/>`;
+      }
+      hits += `<rect class="ehit" data-i="${i}" x="${fx(i * step)}" y="0" width="${fx(step)}" height="${H}"/>`;
+    });
+    let line = "";
+    const solar = series.find((x) => x.line);
+    if (solar) {
+      const pts = rows.map((row, i) => `${fx(i * step + step / 2)},${fx(y0 - row.solar * scale)}`).join(" ");
+      line = `<polyline points="${pts}" fill="none" stroke="${ENERGY_COLORS.solar}" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`;
+    }
+    const plotBox = el("div", "echart-plot");
+    plotBox.innerHTML =
+      `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Verlauf ${series.map((x) => x.label).join(", ")}">` +
+      `${hits}${bars}${line}<line x1="0" x2="${W}" y1="${fx(y0)}" y2="${fx(y0)}" stroke="rgba(255,255,255,.3)" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>`;
+    const max = el("div", "echart-max", fmtKwh(up));
+    plotBox.appendChild(max);
+    // Beschriftung der Zeitachse als HTML, damit sie auf dem Handy lesbar bleibt.
+    const axis = el("div", "echart-x");
+    const days = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+    const months = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"];
+    rows.forEach((row, i) => {
+      const d = new Date(row.t);
+      let txt = null;
+      if (range.bucket === "hour") txt = d.getHours() % 6 === 0 ? `${d.getHours()} Uhr` : null;
+      else if (range.bucket === "month") txt = months[d.getMonth()];
+      else if (range.period === "week") txt = days[d.getDay()];
+      else txt = [1, 5, 10, 15, 20, 25, 30].includes(d.getDate()) ? `${d.getDate()}.` : null;
+      if (!txt) return;
+      const lab = el("span", "", txt);
+      lab.style.left = `${((i + 0.5) / rows.length) * 100}%`;
+      axis.appendChild(lab);
+    });
+    const read = el("div", "echart-read", "Balken antippen für die Werte");
+    const legend = el("div", "echart-legend");
+    for (const sr of series) {
+      const it = el("span", "eleg");
+      const sw = el("i", sr.line ? "line" : "");
+      sw.style.background = ENERGY_COLORS[sr.key];
+      it.append(sw, document.createTextNode(sr.label));
+      legend.appendChild(it);
+    }
+    const when = (t) => {
+      const d = new Date(t);
+      if (range.bucket === "hour") return `${d.getHours()}–${d.getHours() + 1} Uhr`;
+      if (range.bucket === "month") return d.toLocaleDateString("de-DE", { month: "long" });
+      return d.toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "numeric" });
+    };
+    plotBox.querySelectorAll(".ehit").forEach((hit) => {
+      const pick = () => {
+        plotBox.querySelectorAll(".ehit.sel").forEach((x) => x.classList.remove("sel"));
+        hit.classList.add("sel");
+        const row = rows[Number(hit.dataset.i)];
+        read.textContent = `${when(row.t)} · ${series.map((x) => `${x.label} ${fmtKwh(row[x.key])}`).join(" · ")}`;
+      };
+      hit.addEventListener("click", pick);
+      hit.addEventListener("pointerenter", (e) => {
+        if (e.pointerType === "mouse") pick();
+      });
+    });
+    wrap.append(read, plotBox, axis);
+    if (series.length > 1) wrap.appendChild(legend);
+    return wrap;
+  }
+
+  _energyConsumersNode(rank) {
+    const box = el("div", "econs");
+    const max = Math.max(0, ...rank.map((x) => x.kwh || 0));
+    const shown = this._energyConsAll ? rank : rank.slice(0, 10);
+    for (const x of shown) {
+      const row = el("button", "econ");
+      const top = el("div", "econ-top");
+      top.append(el("span", "econ-name", x.name), el("span", "econ-kwh", fmtKwh(x.kwh)));
+      const bar = el("div", "econ-bar");
+      const fill = el("div", "econ-fill");
+      fill.style.width = max > 0 && x.kwh > 0 ? `${Math.max(1.5, (x.kwh / max) * 100)}%` : "0";
+      bar.appendChild(fill);
+      const w = el("div", "econ-w", "");
+      row.append(top, bar, w);
+      row.addEventListener("click", () => this._moreInfo(x.stat));
+      box.appendChild(row);
+      const dev = this._energyN.devices.find((d) => d.stat === x.stat);
+      if (dev && dev.rate) this._energyConsW.push({ rate: dev.rate, node: w });
+    }
+    if (rank.length > shown.length) {
+      const more = el("button", "stextbtn econ-more", `Alle ${rank.length} zeigen`);
+      more.addEventListener("click", () => {
+        this._energyConsAll = true;
+        this._renderEnergy();
+      });
+      box.appendChild(more);
+    }
+    return box;
   }
 
   _buildRoomsNav() {
@@ -6165,6 +7074,80 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .pillbtn.on { background: rgba(255,255,255,.92); color: #1f1f1f; border-color: transparent; }
 header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-icon-size: 18px;
   background: rgba(0,0,0,.28); border-color: rgba(255,255,255,.3); }
+.scroller[hidden] { display: none; }
+.chip.eper { padding: 0 16px; font-size: 13px; font-weight: 600; }
+.chip.eper.active { background: rgba(255,255,255,.9); color: #1f1f1f; border-color: transparent; }
+.screen > .emsg { margin-top: 18px; }
+.tile.etot { justify-content: flex-end; padding: 22px 60px 20px 24px; }
+.tile.etot .icon { top: 24px; transform: none; }
+.etot-val { margin-top: 4px; font-size: 28px; font-weight: 650; letter-spacing: -.02em; white-space: nowrap; }
+.tile.static, .tile.ewide, .tile.eflowtile, .tile.enote { cursor: default; }
+.tile.static:active, .tile.ewide:active, .tile.eflowtile:active, .tile.enote:active { transform: none; }
+.tile.eflowtile { padding: 18px 12px 14px; justify-content: center; }
+.tile.ewide { padding: 22px 24px; justify-content: flex-start; }
+.tile.enote { padding: 22px 24px; gap: 14px; align-items: flex-start; }
+.tile.enote .state { font-size: 14px; opacity: .85; }
+.econ:last-child { border-bottom: 0; }
+.section.shown h2, .section.shown .tile { opacity: 1; animation: none; }
+.eflow { display: grid; grid-template-columns: 1fr minmax(36px, 1.3fr) 1fr minmax(36px, 1.3fr) 1fr;
+  grid-template-rows: auto 36px auto; grid-template-areas: ". . solar . ." ". . lsolar . ." "grid lgrid home lbatt batt";
+  justify-items: center; padding: 6px 0 4px; }
+.eflow.nosolar { grid-template-rows: 0 0 auto; }
+.eflow > .enode, .eflow > .eline { align-self: start; }
+.enode { all: unset; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 0;
+  text-align: center; --c: rgba(255,255,255,.5); }
+.enode-ic { width: 62px; height: 62px; border-radius: 50%; display: grid; place-items: center; margin-bottom: 4px;
+  background: rgba(255,255,255,.08); border: 2px solid var(--c); --mdc-icon-size: 28px; }
+.enode-val { font-size: 18px; font-weight: 650; white-space: nowrap; }
+.enode-sub { font-size: 12px; opacity: .7; white-space: nowrap; }
+.enode.home { grid-area: home; --c: rgba(255,255,255,.85); }
+.enode.solar { grid-area: solar; --c: #d95926; }
+.enode.grid { grid-area: grid; --c: #3987e5; }
+.enode.grid.out { --c: #199e70; }
+.enode.battery { grid-area: batt; --c: rgba(255,255,255,.55); }
+.eline { position: relative; width: 100%; height: 3px; margin-top: 31px; border-radius: 2px; overflow: hidden;
+  background: rgba(255,255,255,.12); --c: rgba(255,255,255,.7); }
+.eline.l-grid { grid-area: lgrid; --c: #3987e5; }
+.eline.l-grid.out { --c: #199e70; }
+.eline.l-battery { grid-area: lbatt; }
+.eflow > .eline.l-solar { grid-area: lsolar; width: 3px; height: 100%; margin-top: 0; align-self: stretch; --c: #d95926; }
+.eline.on::before { content: ""; position: absolute; inset: 0;
+  background: repeating-linear-gradient(90deg, var(--c) 0 8px, transparent 8px 16px); background-size: 16px 100%;
+  animation: eflowx .8s linear infinite; }
+.eline.l-solar.on::before { background: repeating-linear-gradient(180deg, var(--c) 0 8px, transparent 8px 16px);
+  background-size: 100% 16px; animation-name: eflowy; }
+.eline.rev::before { animation-direction: reverse; }
+@keyframes eflowx { to { background-position: 16px 0; } }
+@keyframes eflowy { to { background-position: 0 16px; } }
+@media (prefers-reduced-motion: reduce) { .eline.on::before { animation: none; } }
+.etotals { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.etile { all: unset; cursor: pointer; min-width: 0; padding: 12px 14px; border-radius: 16px; background: rgba(255,255,255,.08); }
+.etile:active { transform: scale(.97); }
+.etile-val { margin-top: 6px; font-size: 20px; font-weight: 650; white-space: nowrap; }
+.echart { display: flex; flex-direction: column; gap: 8px; }
+.echart-read { font-size: 13px; opacity: .8; min-height: 18px; }
+.echart-plot { position: relative; height: 180px; }
+.echart-plot svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.echart-plot path, .echart-plot polyline, .echart-plot line { pointer-events: none; }
+.echart-max { position: absolute; top: -4px; left: 0; font-size: 11px; opacity: .55; pointer-events: none; }
+.ehit { fill: transparent; cursor: pointer; }
+.ehit.sel { fill: rgba(255,255,255,.07); }
+.echart-x { position: relative; height: 16px; font-size: 11px; opacity: .6; }
+.echart-x span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.echart-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; opacity: .85; }
+.eleg { display: inline-flex; align-items: center; gap: 6px; }
+.eleg i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.eleg i.line { width: 14px; height: 2px; border-radius: 1px; }
+.econs { display: flex; flex-direction: column; }
+.econ { all: unset; cursor: pointer; display: block; padding: 10px 2px; border-bottom: 1px solid rgba(255,255,255,.08); }
+.econ-top { display: flex; justify-content: space-between; gap: 12px; font-size: 15px; }
+.econ-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.econ-kwh { flex: none; font-weight: 600; }
+.econ-bar { margin-top: 6px; height: 6px; border-radius: 3px; background: rgba(255,255,255,.08); overflow: hidden; }
+.econ-fill { height: 100%; border-radius: 3px; background: #3987e5; }
+.econ-w { margin-top: 4px; font-size: 12px; opacity: .65; }
+.econ-w:empty { display: none; }
+.econ-more { align-self: center; margin-top: 10px; }
 .ehint { font-size: 13px; opacity: .7; margin: -4px 0 14px; }
 .emsg { font-size: 13px; margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; background: rgba(196,45,45,.5); }
 .erow { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,.08); }
@@ -6486,6 +7469,9 @@ header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-i
   .tile.media .msearch { display: none; }
   .tile.tv { min-height: 124px; }
   .en-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tile.etot { padding: 20px 48px 18px 20px; }
+  .etot-val { font-size: 22px; }
+  .tile.ewide { padding: 18px 16px; }
   .en-value { font-size: 28px; }
   .tile.lights { padding-top: 26px; }
   .slider { left: 20px; right: 20px; }
