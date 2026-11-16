@@ -17,8 +17,9 @@ Installation ein fertiges Dashboard mit der **elvio Room Card** bauen.
 
 ## Schritt 1: Voraussetzungen klären
 
-1. **Karte installiert?** Frag den Nutzer, ob in HACS „elvio Room Card“ als heruntergeladen
-   angezeigt wird. Falls nicht: HACS → „elvio Room Card“ suchen → Herunterladen → Browser neu laden.
+1. **Karte installiert?** Frag den Nutzer, ob „elvio Room Card“ als installiert angezeigt wird –
+   ab Home Assistant 2026.11 im eingebauten Marketplace (Seitenleiste), davor in HACS. Falls
+   nicht: Installation wie im README beschrieben, danach den Browser neu laden.
 2. **Sieht der Connector alles?** Der offizielle Home-Assistant-Connector zeigt nur Geräte, die
    für Sprachassistenten freigegeben sind. Wirken Räume leer oder fehlen offensichtliche Lampen,
    bitte den Nutzer: Einstellungen → Sprachassistenten → Reiter „Freigeben“ → die
