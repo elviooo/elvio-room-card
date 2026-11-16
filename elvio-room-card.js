@@ -66,6 +66,9 @@ const SETUP_MA_SLUG = "d5369777_music_assistant";
 const SETUP_MA_STORE = "https://github.com/music-assistant/home-assistant-addon";
 // Ein Stand für alle Ansichten: sonst fragt jede Ansicht HACS und Supervisor neu.
 let setupCache = null;
+// Speichern in der Dashboard-Konfiguration lädt das Dashboard neu – die Karte wird neu
+// angelegt. Dieses Blatt öffnet die neue Karte dann wieder (gleiche Seite, kurz danach).
+let reopenSheet = null;
 // Energie-Seite: Einstellungen von HA-Energie für alle Karten gemeinsam (eine Abfrage statt
 // einer je Ansicht), alle 10 Minuten neu; Summen und Verlauf bei offener Seite alle 5 Minuten.
 const ENERGY_PREFS_TTL_MS = 10 * 60 * 1000;
@@ -1243,6 +1246,102 @@ const ElvioLeave = {
   },
 };
 
+// ───────────── Hinweise ─────────────
+// Was im Haus nicht stimmt, an einer Stelle: Alarm (Rauch, Wasser, Gas), Geräte nicht
+// erreichbar, Akku knapp, Fenster offen und Regen; für Admins Updates und Reparaturen.
+// Getestet in test/notices.test.mjs.
+
+const NOTICE_OFFLINE_MS = 5 * 60 * 1000;
+const NOTICE_ICONS = {
+  alarm: "mdi:alarm-light-outline", offline: "mdi:lan-disconnect", battery: "mdi:battery-alert-variant-outline",
+  rain: "mdi:weather-pouring", repairs: "mdi:tools", updates: "mdi:update",
+};
+const NOTICE_BATTERY = 20;
+const NOTICE_ALARM_NAMES = { smoke: "Rauch", moisture: "Wasser", gas: "Gas", carbon_monoxide: "Kohlenmonoxid", safety: "Sicherheit" };
+
+const ElvioNotices = {
+  collect({ states, entities, devices, areas, now, ignore, admin, rainText, repairs }) {
+    const out = [];
+    const add = (n) => out.push({ entity: null, path: null, ...n, ignored: (ignore || []).includes(n.key) });
+    const all = Object.values(states || {});
+    const name = (st) => (st.attributes && st.attributes.friendly_name) || st.entity_id;
+    const since = (ms) => ElvioPeople.since(ms, now);
+
+    // Alarm
+    for (const st of all) {
+      const dc = (st.attributes || {}).device_class;
+      if (st.entity_id.startsWith("binary_sensor.") && NOTICE_ALARM_NAMES[dc] && st.state === "on") {
+        add({ key: `alarm:${st.entity_id}`, kind: "alarm", level: 0, title: `${name(st)}: Alarm`, sub: `${NOTICE_ALARM_NAMES[dc]} – bitte nachsehen`, entity: st.entity_id });
+      }
+    }
+
+    // Nicht erreichbar: alle Werte eines Geräts seit mindestens 5 Minuten „nicht verfügbar“.
+    // Ist das übergeordnete Gerät (ganzer Shelly) auch weg, steht nur es da, mit seinen Kanälen.
+    const byDev = {};
+    for (const e of Object.values(entities || {})) {
+      if (!e.device_id || !states[e.entity_id]) continue;
+      (byDev[e.device_id] = byDev[e.device_id] || []).push(states[e.entity_id]);
+    }
+    const offline = {};
+    for (const [id, sts] of Object.entries(byDev)) {
+      const d = devices[id];
+      if (!d || d.disabled_by || d.entry_type === "service") continue;
+      if (!sts.every((x) => x.state === "unavailable")) continue;
+      const newest = Math.max(...sts.map((x) => Date.parse(x.last_changed) || 0));
+      if (now - newest < NOTICE_OFFLINE_MS) continue;
+      offline[id] = { d, sts, newest, children: 0 };
+    }
+    for (const o of Object.values(offline)) if (offline[o.d.via_device_id]) offline[o.d.via_device_id].children++;
+    for (const [id, o] of Object.entries(offline)) {
+      if (offline[o.d.via_device_id]) continue;
+      const area = o.d.area_id && areas && areas[o.d.area_id] ? areas[o.d.area_id].name : null;
+      const parts = [o.children ? `mit ${o.children} ${o.children === 1 ? "Kanal" : "Kanälen"}` : area, since(o.newest)].filter(Boolean);
+      add({ key: `offline:${id}`, kind: "offline", level: 1, title: `${o.d.name_by_user || o.d.name || "Gerät"} nicht erreichbar`, sub: parts.join(" · "), entity: o.sts[0].entity_id });
+    }
+    out.sort((a, b) => a.level - b.level || (a.kind === "offline" && b.kind === "offline" ? a.title.localeCompare(b.title, "de") : 0));
+
+    // Akku knapp (Handys stehen bei „Personen“)
+    for (const st of all) {
+      const a = st.attributes || {};
+      if (a.device_class !== "battery") continue;
+      const e = (entities || {})[st.entity_id] || {};
+      if (e.platform === "mobile_app") continue;
+      if (st.entity_id.startsWith("sensor.")) {
+        const v = Number(st.state);
+        if (st.state !== "" && Number.isFinite(v) && v <= NOTICE_BATTERY) {
+          add({ key: `battery:${st.entity_id}`, kind: "battery", level: 2, title: name(st), sub: `Akku ${Math.round(v)} %`, entity: st.entity_id });
+        }
+      } else if (st.entity_id.startsWith("binary_sensor.") && st.state === "on") {
+        add({ key: `battery:${st.entity_id}`, kind: "battery", level: 2, title: name(st), sub: "Akku schwach", entity: st.entity_id });
+      }
+    }
+
+    // Fenster offen und Regen angesagt
+    const open = all.filter((st) => st.entity_id.startsWith("binary_sensor.") && ["window", "opening"].includes((st.attributes || {}).device_class) && st.state === "on");
+    if (open.length && rainText) {
+      const names = open.map(name);
+      add({ key: "rain", kind: "rain", level: 3, title: `${names.length > 2 ? `${names.length} Fenster` : names.join(", ")} offen`, sub: rainText, entity: open[0].entity_id });
+    }
+
+    if (admin && repairs > 0) {
+      add({ key: "repairs", kind: "repairs", level: 4, title: `${repairs} ${repairs === 1 ? "Reparatur" : "Reparaturen"} in Home Assistant`, sub: "Einstellungen → Reparaturen", path: "/config/repairs" });
+    }
+    if (admin) {
+      const upd = all.filter((st) => st.entity_id.startsWith("update.") && st.state === "on");
+      if (upd.length) {
+        const names = upd.map(name);
+        add({
+          key: "updates", kind: "updates", level: 5,
+          title: `${upd.length} ${upd.length === 1 ? "Update" : "Updates"} verfügbar`,
+          sub: names.length > 3 ? `${names.slice(0, 3).join(", ")} …` : names.join(", "),
+          path: "/config/updates",
+        });
+      }
+    }
+    return out;
+  },
+};
+
 // ───────────── Gegensprechen über SIP Core ─────────────
 // SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
 // Änderung als Ereignis „sipcore-update“ am window. Benutzt werden nur: callState
@@ -1609,6 +1708,7 @@ class ElvioRoomCard extends HTMLElement {
       if (regChanged && this._editMode === "devices") this._renderEdit();
       if (regChanged && this._editMode === "views") this._renderViews();
       if (this._editMode === "leave") this._renderLeave(true);
+      if (this._editMode === "notices") this._renderNotices(true);
       // Neues Stockwerk aus dem Raum-Blatt: erst jetzt kennt hass.floors es als Auswahl.
       if (prev && hass.floors !== prev.floors && this._editMode === "room") this._renderRoomForm();
       if (this._editMode === "automations") this._renderAutomations();
@@ -1626,6 +1726,7 @@ class ElvioRoomCard extends HTMLElement {
     const floorForm = open && this._editMode === "floor" && !!this._floorDraft;
     const sceneForm = open && this._editMode === "scene" && !!this._sceneDraft;
     const leaveOpen = open && this._editMode === "leave";
+    const noticesOpen = open && this._editMode === "notices";
     const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
     const energyOpen = this._energyWrap && !this._energyWrap.hidden;
     const peopleOpen = this._peopleWrap && !this._peopleWrap.hidden;
@@ -1662,6 +1763,7 @@ class ElvioRoomCard extends HTMLElement {
       this._editWrap.hidden = false;
       this._renderSceneForm();
     }
+    if (noticesOpen) this._openNotices();
     if (leaveOpen) {
       this._editMode = "leave";
       this._editActions.replaceChildren();
@@ -1995,6 +2097,9 @@ class ElvioRoomCard extends HTMLElement {
     const hero = el("section", "hero");
     this._status = el("div", "status");
     this._chips = el("div", "chips");
+    // Neuer, leerer Behälter: der Merker des alten Inhalts gilt nicht mehr (sonst blieben die
+    // Chips nach einem Neuaufbau leer, bis sich zufällig etwas ändert).
+    this._chipsKey = "";
     hero.append(this._status, el("h1", "", c.title), this._chips);
     // Szenen des Raums (bzw. des Hauses auf Zuhause) als Knöpfe unter dem Titel.
     this._sceneChips = el("div", "chips scenechips");
@@ -2109,6 +2214,16 @@ class ElvioRoomCard extends HTMLElement {
       for (const sec of frame.querySelectorAll(".section")) io.observe(sec);
     } else {
       for (const sec of frame.querySelectorAll(".section")) sec.classList.add("in");
+    }
+    if (!quiet && reopenSheet && reopenSheet.path === location.pathname && Date.now() - reopenSheet.at < 15000) {
+      const mode = reopenSheet.mode;
+      reopenSheet = null;
+      setTimeout(() => {
+        if (!this.isConnected) return;
+        if (mode === "notices") this._openNotices();
+        else if (mode === "views") this._openViews();
+        else if (mode === "leave") this._openLeave();
+      }, 50);
     }
   }
 
@@ -2632,6 +2747,20 @@ class ElvioRoomCard extends HTMLElement {
   _renderChips() {
     const hass = this._hass;
     const chips = [];
+    // Hinweise (Zuhause): nur wenn es etwas gibt; rot bei Alarm.
+    if (this._config.notices !== false && this._isHomeCard()) {
+      const shown = this._notices().filter((n) => !n.ignored);
+      if (shown.length) {
+        const alarm = shown.some((n) => n.kind === "alarm");
+        chips.push({
+          id: "notices",
+          kind: `entity notices${alarm ? " alarm" : ""}`,
+          icon: alarm ? "mdi:alarm-light-outline" : "mdi:alert-circle-outline",
+          title: `${shown.length} ${shown.length === 1 ? "Hinweis" : "Hinweise"}`,
+          sub: shown[0].title,
+        });
+      }
+    }
     for (const chipId of this._config.chips || []) {
       // „now_playing“ = der Player, den auch die Live-Karte zeigt – nur solange etwas spielt.
       let id = chipId;
@@ -2714,7 +2843,13 @@ class ElvioRoomCard extends HTMLElement {
       // Quelle, Gruppieren, Sensor: Verlauf).
       const node = el("button", `chip ${chip.kind}`);
       node.addEventListener("click", () =>
-        chip.id === "offen" ? this._openOpenThings() : chip.id === "setup" ? this._openSetup() : this._openMedia(chip.id),
+        chip.id === "offen"
+          ? this._openOpenThings()
+          : chip.id === "setup"
+            ? this._openSetup()
+            : chip.id === "notices"
+              ? this._openNotices()
+              : this._openMedia(chip.id),
       );
       const av = el("div", "av");
       if (chip.picture) {
@@ -5589,6 +5724,132 @@ class ElvioRoomCard extends HTMLElement {
     }
   }
 
+  // ───────────── Hinweise ─────────────
+
+  // Hinweise jetzt (mit Ausgeblendeten, markiert). Neu gerechnet bei jedem neuen Zustand, sonst
+  // höchstens einmal je Minute (die 5 Minuten bis „nicht erreichbar“ laufen auch ohne Änderung).
+  _notices() {
+    const hass = this._hass;
+    const now = Date.now();
+    const admin = this._isAdmin();
+    if (admin && (!this._repairsAt || now - this._repairsAt > 10 * 60 * 1000)) {
+      this._repairsAt = now;
+      hass.callWS({ type: "repairs/list_issues" }).then(
+        (r) => {
+          const n = ((r && r.issues) || []).filter((i) => !i.ignored).length;
+          if (n !== (this._repairsCount || 0)) {
+            this._repairsCount = n;
+            this._noticeCache = null;
+          }
+        },
+        () => {},
+      );
+    }
+    const c = this._noticeCache;
+    if (c && c.states === hass.states && now - c.at < 60000) return c.list;
+    const weather = (this._tiles || []).find((t) => t.cfg && t.cfg.type === "weather");
+    const list = ElvioNotices.collect({
+      states: hass.states, entities: hass.entities || {}, devices: hass.devices || {}, areas: hass.areas || {},
+      now, ignore: this._noticeIgnore(), admin, rainText: (weather && weather.rainText) || "", repairs: this._repairsCount || 0,
+    });
+    this._noticeCache = { states: hass.states, at: now, list };
+    return list;
+  }
+
+  _noticeIgnore() {
+    const d = this._dashboardConfig();
+    if (d) this._noticeCfgLast = d;
+    const n = ((d || this._noticeCfgLast || {}).elvio_notices) || {};
+    return Array.isArray(n.ignore) ? n.ignore : [];
+  }
+
+  _openNotices() {
+    this._editMode = "notices";
+    this._noticesKey = null;
+    this._noticeCache = null;
+    this._editActions.replaceChildren();
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderNotices();
+  }
+
+  _renderNotices(soft = false) {
+    if (this._editMode !== "notices" || this._editWrap.hidden) return;
+    const all = this._notices();
+    const admin = this._isAdmin();
+    const key = JSON.stringify([all, admin, !!this._noticesIgnoredOpen]);
+    if (soft && key === this._noticesKey) return;
+    this._noticesKey = key;
+    const list = this._editList;
+    list.innerHTML = "";
+    const shown = all.filter((n) => !n.ignored);
+    const hidden = all.filter((n) => n.ignored);
+    this._editTitle.textContent = "Hinweise";
+    this._editHint.textContent = shown.length ? "Was im Haus gerade nicht stimmt. Antippen zeigt mehr." : "";
+    if (!shown.length) {
+      const box = el("div", "cbox");
+      box.append(icon("mdi:check-circle-outline"), el("div", "ctitle", "Alles in Ordnung"), el("div", "ctext", hidden.length ? `${hidden.length} ausgeblendet` : "Keine Hinweise."));
+      list.appendChild(box);
+    }
+    const row = (n, isHidden) => {
+      const r = this._infoRow(NOTICE_ICONS[n.kind] || "mdi:alert-circle-outline", n.title, n.sub, `notice ${n.kind}${isHidden ? " ignored" : ""}`);
+      const t = r.querySelector(".etext");
+      if (n.entity || n.path) {
+        t.classList.add("elink");
+        t.addEventListener("click", () => this._noticeGo(n));
+      }
+      if (admin) {
+        const b = el("button", "stextbtn emove", isHidden ? "Wieder zeigen" : "Ausblenden");
+        b.addEventListener("click", () => this._ignoreNotice(n.key, !isHidden, b));
+        r.appendChild(b);
+      }
+      return r;
+    };
+    for (const n of shown) list.appendChild(row(n, false));
+    if (hidden.length && admin) {
+      const open = !!this._noticesIgnoredOpen;
+      list.appendChild(this._foldButton(`Ausgeblendet (${hidden.length})`, open, () => {
+        this._noticesIgnoredOpen = !open;
+        this._renderNotices();
+      }));
+      if (open) for (const n of hidden) list.appendChild(row(n, true));
+    }
+  }
+
+  _noticeGo(n) {
+    this._editWrap.hidden = true;
+    if (n.entity) this._moreInfo(n.entity);
+    else if (n.path) {
+      this._confirmPath = n.path;
+      this._confirmWrap.hidden = false;
+    }
+  }
+
+  // Ausblenden steht im Dashboard (elvio_notices.ignore) und gilt für alle Tablets damit.
+  async _ignoreNotice(key, on, btn) {
+    btn.disabled = true;
+    this._editMsg.hidden = true;
+    const dash = this._dashPath();
+    const urlPath = dash === "lovelace" ? null : dash;
+    try {
+      const cfg = await this._hass.callWS({ type: "lovelace/config", url_path: urlPath });
+      const cur = new Set(((cfg.elvio_notices || {}).ignore) || []);
+      if (on) cur.add(key);
+      else cur.delete(key);
+      if (cur.size) cfg.elvio_notices = { ...(cfg.elvio_notices || {}), ignore: [...cur] };
+      else delete cfg.elvio_notices;
+      reopenSheet = { mode: "notices", path: location.pathname, at: Date.now() };
+      await this._hass.callWS({ type: "lovelace/config/save", url_path: urlPath, config: cfg });
+      this._noticeCfgLast = cfg;
+      this._noticeCache = null;
+      this._renderNotices();
+    } catch (err) {
+      reopenSheet = null;
+      btn.disabled = false;
+      this._roomFormError(`Nicht gespeichert: ${setupErrText(err)}`);
+    }
+  }
+
   // ───────────── Haus verlassen ─────────────
 
   _openLeave() {
@@ -5798,6 +6059,7 @@ class ElvioRoomCard extends HTMLElement {
       const urlPath = dash === "lovelace" ? null : dash;
       const cfg = await hass.callWS({ type: "lovelace/config", url_path: urlPath });
       cfg.elvio_leave = { switches: d.switches, media: d.media, auto: d.auto };
+      reopenSheet = { mode: "leave", path: location.pathname, at: Date.now() };
       await hass.callWS({ type: "lovelace/config/save", url_path: urlPath, config: cfg });
       this._leaveCfgLast = cfg;
       this._leaveDraft = null;
@@ -6023,6 +6285,7 @@ class ElvioRoomCard extends HTMLElement {
       else views[key] = false;
       if (Object.keys(views).length) cfg.elvio_views = views;
       else delete cfg.elvio_views;
+      reopenSheet = { mode: "views", path: location.pathname, at: Date.now() };
       await this._hass.callWS({ type: "lovelace/config/save", url_path: urlPath, config: cfg });
       this._viewPrefsLast = views;
       sw.classList.toggle("on", on);
@@ -8669,6 +8932,13 @@ header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-i
 .chip.sceneadd { background: none; border-style: dashed; }
 .chip.leave { background: rgba(255,255,255,.2); }
 .erow.warn .eicon { background: rgba(196,45,45,.6); }
+.chip.notices .av { background: rgba(245,165,36,.45); }
+.chip.notices.alarm { background: rgba(196,45,45,.8); border-color: transparent; }
+.erow.notice .eicon { background: rgba(245,165,36,.3); }
+.erow.notice.alarm .eicon { background: rgba(196,45,45,.75); }
+.erow.notice.updates .eicon, .erow.notice.repairs .eicon { background: rgba(255,255,255,.12); }
+.erow.notice.ignored { opacity: .6; }
+.etext.elink { cursor: pointer; }
 .escrow { border-bottom: 1px solid rgba(255,255,255,.08); }
 .escrow > .erow { border-bottom: 0; }
 .esc-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 0 0 14px 48px; }

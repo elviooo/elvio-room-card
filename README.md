@@ -165,6 +165,22 @@ scenes.yaml` in der `configuration.yaml`), am Bereich des Raums – sie funktion
 in Automationen und per Sprache. Zuhause erkennt die Karte am ersten Leisten-Eintrag;
 `scenes: true` bzw. `scenes: false` in einer Karte zeigt bzw. versteckt die Reihe ausdrücklich.
 
+## Hinweise
+
+Auf Zuhause erscheint ein Chip **„2 Hinweise“**, sobald im Haus etwas nicht stimmt (rot bei
+Alarm). Ein Tipp öffnet die Liste:
+
+- **Alarm:** Rauch-, Wasser-, Gas- oder Kohlenmonoxid-Melder schlagen an.
+- **Nicht erreichbar:** Gerät, dessen Werte seit mindestens 5 Minuten alle „nicht verfügbar“ sind
+  (ein ganzer Shelly einmal, mit der Zahl seiner Kanäle), mit Raum und „seit“.
+- **Akku knapp:** Sensoren mit 20 % oder weniger (Handys nicht – die stehen bei „Personen“).
+- **Fenster offen und Regen:** braucht die Kachel `weather` auf derselben Ansicht.
+- **Nur für Admins:** verfügbare Updates und Reparaturen, die Home Assistant meldet.
+
+Antippen zeigt das Gerät bzw. führt (nach Rückfrage) in die HA-Oberfläche. Admins können
+einzelne Hinweise ausblenden und unter „Ausgeblendet“ wieder zeigen (gespeichert unter
+`elvio_notices` in der Dashboard-Konfiguration). `notices: false` in der Karte blendet den Chip aus.
+
 ## Haus verlassen
 
 Auf Zuhause steht vorn in der Szenen-Reihe **„Haus verlassen“** (für alle). Antippen zeigt eine
