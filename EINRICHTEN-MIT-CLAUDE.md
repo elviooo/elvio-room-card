@@ -41,14 +41,16 @@ das Dashboard sind vor allem:
 | `weather.*` | `weather` |
 | `calendar.*` | `agenda` (Liste unter `entities`) |
 | `person.*` | als Chip oben (`chips`) |
-| `sensor.*` Temperatur | `temperature:` der Ansicht bzw. des Raums in `nav` |
+| `sensor.*` Temperatur | `temperature:` der Karte (Zuhause); Raumtemperatur als Temperatursensor am Bereich in HA |
 
 Zeig dem Nutzer vor dem Bauen kurz, was du gefunden hast (Räume und Anzahl Geräte), und frag,
-ob Räume wegfallen oder anders heißen sollen.
+ob Räume wegfallen oder anders heißen sollen. Umbenennen und Weglassen passiert in HA an den Bereichen (Name bzw. Label „Nicht am Tablet“), nicht in der YAML.
 
 ## Schritt 3: YAML bauen
 
-Aufbau: eine Ansicht „Zuhause“ als Übersicht, dann je Raum eine Ansicht. Jede Ansicht ist
+Aufbau: eine Ansicht „Zuhause“ als Übersicht, eine Ansicht „Raum“ (`path: raum`, `area: auto`)
+für alle Räume und eine Ansicht „Einstellungen“. Räume sind die Bereiche in HA – sie stehen
+**nicht** in `nav`; Icon, Bild und Temperatur des Raums gehören an den Bereich. Jede Ansicht ist
 `type: panel` mit genau **einer** `custom:elvio-room-card`. Gemeinsame Einstellungen stehen
 einmal oben als YAML-Anker (`&basis`) und werden mit `<<: *basis` übernommen.
 
@@ -57,10 +59,9 @@ basis: &basis
   type: custom:elvio-room-card
   brand: "{name}."                 # {name} = Name des Zuhauses aus HA (Einstellungen → System → Allgemein)
   menu_path: /lovelace/0           # Tipp auf den Schriftzug führt (nach Nachfrage) in die normale Oberfläche
-  nav:                             # Leiste mit allen Ansichten; room: true = erscheint unter „Räume“
+  nav:                             # Leiste mit den Ansichten; „Räume“ erscheint automatisch hinter dem ersten Eintrag
     - {name: Zuhause, path: /DASHBOARD-URL/zuhause, icon: mdi:home-outline}
-    - {name: Wohnzimmer, path: /DASHBOARD-URL/wohnzimmer, icon: mdi:sofa-outline, room: true,
-       lights: [light.BEISPIEL], temperature: climate.BEISPIEL}
+    - {name: Einstellungen, path: /DASHBOARD-URL/einstellungen, icon: mdi:cog-outline}
 
 views:
   - title: Zuhause
@@ -77,16 +78,24 @@ views:
             tiles:
               - {type: action, entity: scene.BEISPIEL, icon: mdi:weather-night}
 
-  - title: Wohnzimmer
-    path: wohnzimmer
+  - title: Raum
+    path: raum
     type: panel
     cards:
       - <<: *basis
-        title: Wohnzimmer
-        area: Wohnzimmer                 # Name des Bereichs in HA
+        title: Raum
+        area: auto                       # Raum aus der Adresse (…/raum?bereich=<id>)
         tiles:
-          - {type: lights, name: Licht, entities: [light.BEISPIEL]}
-          - {type: climate, entity: climate.BEISPIEL}
+          - {type: lights, name: Licht, entities: []}
+
+  - title: Einstellungen
+    path: einstellungen
+    type: panel
+    cards:
+      - <<: *basis
+        title: Einstellungen
+        tiles:
+          - {type: setup}
 ```
 
 `DASHBOARD-URL` ist der Pfad des neuen Dashboards (steht nach dem Anlegen in der Adresszeile,
@@ -94,17 +103,19 @@ z. B. `dashboard-tablet`). Alle `BEISPIEL`-Werte durch echte IDs ersetzen.
 
 ### Was die Karte von selbst macht
 
-Mit `area:` (oder wenn der Ansichtstitel einem Raum in `nav` mit `room: true` entspricht)
-holt die Karte neue Geräte des Raums **automatisch** dazu: Lichter in die Licht-Kachel, alles
-andere unter „Weitere Geräte“. Geräte lassen sich in HA mit den Labels **„Am Tablet“** bzw.
-**„Nicht am Tablet“** gezielt ein- oder ausblenden. Du musst also nicht jedes Gerät einzeln
-eintragen; die wichtigsten reichen.
+Mit `area:` (oder, nur alte Dashboards mit Räumen in `nav`: wenn der Ansichtstitel einem Raum in `nav` mit `room: true` entspricht)
+holt die Karte neue Geräte des Raums **automatisch** dazu: Lichter in die Licht-Kachel, Kameras
+unter „Kameras“, Sensoren und Melder unter „Sensoren“, alles andere unter „Weitere Geräte“.
+Geräte lassen sich in HA mit den Labels **„Am Tablet“** bzw. **„Nicht am Tablet“** gezielt ein-
+oder ausblenden – am Tablet geht das mit Admin-Anmeldung über den Stift im Raum (dort auch
+„+ Hinzufügen“ für Kameras, Sensoren und Geräte aus anderen Räumen). Du musst also nicht jedes
+Gerät einzeln eintragen; die wichtigsten reichen.
 
 ### Referenz
 
 Pflicht je Karte: `title` und mindestens eine Kachel in `tiles`.
 
-**Karte:** `title`, `brand`, `menu_path`, `area`, `nav`, `chips`, `tiles`, `sections`
+**Karte:** `title`, `brand`, `menu_path`, `area` (`auto` = Raum aus der Adresse), `nav`, `rooms_path`, `chips`, `tiles`, `sections`
 (`title` + `tiles`), `temperature`, `background` (Bild-URL wie `/local/…jpg` oder `camera.*`),
 `logo`, `media_players` (zusätzliche Player), `screensaver` (`after` Sekunden, `images`,
 `entity`, `night_entity`, `night_from`, `night_to`).

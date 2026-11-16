@@ -78,6 +78,63 @@ und startet die App.
 `/home/overview`. kiosk-mode blendet die Seitenleiste sonst auch dort weiter aus, und unter iOS
 lässt sich das Menü nicht öffnen.
 
+## Räume aus Home Assistant
+
+Ab v1.6.0 sind Räume die **Bereiche** in Home Assistant. Name, Icon, Bild, Temperatursensor,
+Stockwerk und Reihenfolge stehen im Bereich; das Dashboard braucht nur noch drei Ansichten:
+
+```yaml
+basis: &basis
+  type: custom:elvio-room-card
+  brand: "{name}."
+  menu_path: /lovelace/0
+  nav:
+    - {name: Zuhause, path: /dashboard-tablet/zuhause, icon: mdi:home-outline}
+    - {name: Einstellungen, path: /dashboard-tablet/einstellungen, icon: mdi:cog-outline}
+
+views:
+  - {title: Zuhause, path: zuhause, type: panel, cards: [{<<: *basis, title: Zuhause, tiles: [...]}]}
+  - title: Raum
+    path: raum
+    type: panel
+    cards:
+      - <<: *basis
+        title: Raum
+        area: auto                       # Raum kommt aus der Adresse: …/raum?bereich=<id>
+        tiles: [{type: lights, name: Licht, entities: []}]
+  - {title: Einstellungen, path: einstellungen, type: panel, cards: [{<<: *basis, title: Einstellungen, tiles: [{type: setup}]}]}
+```
+
+- **Leiste:** „Räume“ erscheint hinter dem ersten Eintrag; die Übersicht gruppiert nach Stockwerk.
+- **Räume verwalten** (nur mit Admin-Anmeldung): Raumübersicht → **Bearbeiten**. Raum
+  hinzufügen, umbenennen, Stockwerk, Icon, Bild (Galerie oder eigenes Foto), Temperatur,
+  „Am Tablet zeigen“, Reihenfolge (Pfeile), löschen. Gespeichert wird in HA.
+- **Geräte hinzufügen** (nur mit Admin-Anmeldung): im Raum oben der Stift → **+ Hinzufügen**.
+  Sucht im ganzen Haus (Filter: Kameras & Klingeln, Sensoren, Schalter & Steckdosen, Licht,
+  Sonstiges); Antippen zeigt die Funktionen des Geräts zum Anhaken. Sinnvolles ist vorausgewählt
+  (Kamera, Bewegung, Tür/Fenster, Temperatur, Rauch …), Messwerte wie Leistung oder Energie
+  nicht. Ein Gerät ohne Raum kommt ganz in den Raum, eines aus einem anderen Raum nur mit den
+  angehakten Funktionen (Mehrkanal-Aktoren: jeder Ausgang in seinem Raum). Im Raum stehen
+  hinzugefügte Dinge unter „Weitere Geräte“, „Kameras“ und „Sensoren“. Gilt auch für Zonen wie
+  Garten oder Einfahrt – in HA ebenfalls Bereiche.
+- **Bild ohne eigene Wahl:** passt der Name zu einem Bild im Repo (`bilder/`), wird es genommen.
+- **Ausblenden:** Label „Nicht am Tablet“ am Bereich.
+- **Karten ohne `nav`** bekommen wie bisher keine Leiste und damit auch keinen Eintrag „Räume“.
+- **`rooms_path`** (optional): andere Adresse der Raum-Ansicht als `/<dashboard>/raum`.
+- **Alte Dashboards** (Räume mit `room: true` in `nav`) laufen unverändert. Umstellen per
+  Einrichtungspunkt „Räume aus Home Assistant“: sichert das Dashboard als verstecktes
+  Dashboard „… (Sicherung Datum)“, übernimmt Icon/Bild/Temperatur in die Bereiche und baut auf
+  die Ansicht `raum` um. Hat eine Raum-Ansicht Kacheln, die die Karte nicht von selbst zeigt,
+  wird nichts geändert und der Grund genannt. Bereiche, die bisher kein Raum in `nav` waren,
+  bekommen das Label „Nicht am Tablet“ – das Tablet zeigt danach dieselben Räume wie vorher
+  (im Raum-Blatt wieder einblendbar). YAML-Dashboards nach dem Beispiel oben von Hand umstellen.
+- **Zurück zum alten Dashboard:** Sicherung öffnen (Einstellungen → Dashboards → „… (Sicherung
+  Datum)“) → ⋮ → Raw-Konfigurationseditor → alles kopieren; im Tablet-Dashboard (`?disable_km`
+  an der Adresse) ebenso den Raw-Konfigurationseditor öffnen, alles ersetzen, speichern. Icon,
+  Bild, Reihenfolge und Labels der Bereiche bleiben; das alte Dashboard liest sie nicht.
+- Getestet mit Home Assistant 2026.11 (Stockwerke, Bereichs-Reihenfolge und Temperatursensor
+  am Bereich brauchen eine aktuelle Version).
+
 ## Gegensprechen über SIP Core
 
 Mit [SIP Core](https://github.com/TECH7Fox/sipcore-hass-integration) (HACS, getestet mit
@@ -137,6 +194,7 @@ besten in einer Ansicht „Einstellungen“) prüft das und richtet es auf Knopf
 | Raumkarte aktuell | Neue Version über HACS laden |
 | Seitenleiste ausblenden | [kiosk-mode](https://github.com/NemesisRE/kiosk-mode) über HACS installieren, Kopf- und Seitenleiste in diesem Dashboard ausblenden (`?disable_km` zum Bearbeiten) |
 | Startseite für alle | Dieses Dashboard öffnet beim Start der App |
+| Räume aus Home Assistant | Nur bei alten Dashboards: sichern, Räume in die Bereiche übernehmen, auf die Ansicht `raum` umbauen |
 | Music Assistant | Add-on installieren, starten, mit Home Assistant verbinden (nur Home Assistant OS) |
 | Push: günstig tanken | Nur mit Tankerkönig: Sorte und Empfänger wählen, Sensoren und Automation werden angelegt |
 
@@ -147,3 +205,16 @@ besten in einer Ansicht „Einstellungen“) prüft das und richtet es auf Knopf
 Fehlt etwas, zeigt die Karte Admins oben einen Hinweis „2 offen“ (abschalten mit
 `setup_hint: false`). Ohne Admin-Anmeldung sieht man davon nichts, und nichts wird ungefragt
 installiert.
+
+## Entwicklung
+
+```bash
+node --test                    # reine Logik (Node ≥ 20, keine Pakete)
+HA_URL=http://<ha-adresse>:8123 node tools/dev-server.mjs   # HA über http://localhost:8765 + Entwicklerkarte
+```
+
+Der Entwickler-Proxy zeigt Home Assistant unter `http://localhost:8765` und liefert dazu
+`/elvio-dev/elvio-room-card-dev.js` aus dem Repo (Elementname `elvio-room-card-dev`). In HA die
+Ressource `/elvio-dev/elvio-room-card-dev.js` (Typ Modul, relative Adresse) eintragen und im
+Test-Dashboard `type: custom:elvio-room-card-dev` verwenden; die installierte Karte bleibt
+unberührt, am Tablet liefert HA für die Ressource nur 404. Über den Proxy einmal bei HA anmelden. Anderer lokaler Port: `PORT=8766` davorsetzen.

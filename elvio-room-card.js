@@ -88,6 +88,79 @@ const AUTO_DOMAINS = [
 // jedes Update per Git pull. IDs fest, damit auch ein Benutzer ohne Admin-Rechte sie lesen kann.
 const LABEL_SHOW = { id: "am_tablet", name: "Am Tablet", icon: "mdi:tablet-dashboard" };
 const LABEL_HIDE = { id: "nicht_am_tablet", name: "Nicht am Tablet", icon: "mdi:eye-off-outline" };
+// Geräte hinzufügen: was sich einem Raum zuordnen lässt und was davon vorausgewählt ist.
+const PICK_DOMAINS = [...AUTO_DOMAINS, "sensor", "binary_sensor", "event", "button", "siren"];
+const USEFUL_CLASSES = {
+  sensor: [
+    "temperature", "humidity", "illuminance", "carbon_dioxide", "pm25", "pm10", "aqi",
+    "volatile_organic_compounds", "volatile_organic_compounds_parts", "moisture",
+    "precipitation", "precipitation_intensity", "wind_speed",
+  ],
+  binary_sensor: [
+    "motion", "occupancy", "presence", "door", "window", "garage_door", "opening",
+    "smoke", "moisture", "gas", "carbon_monoxide", "safety", "lock",
+  ],
+  event: ["doorbell"],
+};
+// Filter und Symbole in der Auswahl „Hinzufügen“ (Art aus ElvioRooms.deviceKind).
+const ADD_FILTERS = [
+  { key: "all", label: "Alle" },
+  { key: "camera", label: "Kameras & Klingeln" },
+  { key: "sensor", label: "Sensoren" },
+  { key: "switch", label: "Schalter & Steckdosen" },
+  { key: "light", label: "Licht" },
+  { key: "other", label: "Sonstiges" },
+];
+const KIND_ICONS = {
+  camera: "mdi:cctv",
+  sensor: "mdi:motion-sensor",
+  switch: "mdi:power-socket-de",
+  light: "mdi:lightbulb-outline",
+  other: "mdi:devices",
+};
+const ALERT_CLASSES = ["smoke", "moisture", "gas", "carbon_monoxide", "safety"];
+// Symbole wie in HA: [an, aus] für Melder, sonst eines.
+const STATE_ICONS = {
+  binary_sensor: {
+    motion: ["mdi:motion-sensor", "mdi:motion-sensor-off"],
+    occupancy: ["mdi:home-account", "mdi:home-outline"],
+    presence: ["mdi:home-account", "mdi:home-outline"],
+    door: ["mdi:door-open", "mdi:door-closed"],
+    window: ["mdi:window-open-variant", "mdi:window-closed-variant"],
+    garage_door: ["mdi:garage-open", "mdi:garage"],
+    opening: ["mdi:square-outline", "mdi:square"],
+    smoke: ["mdi:smoke-detector-variant-alert", "mdi:smoke-detector-variant"],
+    moisture: ["mdi:water-alert", "mdi:water-off"],
+    gas: ["mdi:alert-circle", "mdi:check-circle"],
+    carbon_monoxide: ["mdi:alert-circle", "mdi:check-circle"],
+    safety: ["mdi:alert-circle", "mdi:check-circle"],
+    lock: ["mdi:lock-open", "mdi:lock"],
+  },
+  sensor: {
+    temperature: "mdi:thermometer",
+    humidity: "mdi:water-percent",
+    illuminance: "mdi:brightness-5",
+    carbon_dioxide: "mdi:molecule-co2",
+    pm25: "mdi:blur",
+    pm10: "mdi:blur",
+    aqi: "mdi:air-filter",
+    moisture: "mdi:water-percent",
+    precipitation: "mdi:weather-rainy",
+    precipitation_intensity: "mdi:weather-rainy",
+    wind_speed: "mdi:weather-windy",
+    power: "mdi:flash",
+    energy: "mdi:lightning-bolt",
+    voltage: "mdi:sine-wave",
+    current: "mdi:current-ac",
+    battery: "mdi:battery",
+    signal_strength: "mdi:wifi",
+  },
+  event: {
+    doorbell: "mdi:doorbell",
+    button: "mdi:gesture-tap-button",
+    motion: "mdi:motion-sensor",
+  },
+};
 // Wo dieses Tablet hängt: je Gerät im Browser gespeichert, nicht in HA – ein zweites
 // Tablet oder ein Handy hängt woanders bzw. nirgends.
 const TABLET_ROOM_KEY = "elvio.tablet_room";
@@ -142,9 +215,428 @@ function icon(name) {
   return node;
 }
 
+// Deutlicher Knopf mit Symbol und Text (Bearbeiten, Geräte, Hinzufügen) – ein Textlink allein
+// geht auf Fotos und am Wandtablet unter.
+function pillButton(iconName, text) {
+  const b = el("button", "pillbtn");
+  setPill(b, iconName, text);
+  return b;
+}
+
+function setPill(b, iconName, text) {
+  b.replaceChildren(icon(iconName), el("span", "", text));
+}
+
 function setupErrText(err) {
   return (err && ((err.body && err.body.message) || err.message || err.code)) || String(err);
 }
+
+// ───────────── Räume aus HA-Bereichen (reine Logik, in Node testbar) ─────────────
+// Ein Raum ist ein Bereich in Home Assistant: Name, Icon, Bild, Temperatursensor, Stockwerk
+// und Reihenfolge stehen dort – der Kunde ändert sie am Tablet, Updates der Karte lassen
+// sie in Ruhe. Altmodus: Räume als Einträge mit room: true in nav (bis v1.5.0).
+
+// Bilder aus dem Repo (bilder/). Fest auf einen Tag, damit sich ein Raumbild nicht
+// unbemerkt ändert, wenn im Repo ein Bild getauscht wird.
+const IMAGE_BASE = "https://cdn.jsdelivr.net/gh/elviooo/elvio-room-card@v1.3.0/bilder/";
+const BUNDLED_IMAGES = [
+  "flur_oben", "flur_unten", "gaeste_bad", "garage", "garten", "kind_1", "kind_2",
+  "master_bad", "schlafzimmer", "sicherheit", "wohnbereich", "zuhause",
+];
+// Auswahl im Raum-Blatt – bewusst kein Freitext, am Tablet tippt niemand „mdi:…“.
+const ROOM_ICONS = [
+  "mdi:sofa-outline", "mdi:television", "mdi:silverware-fork-knife", "mdi:stove", "mdi:fridge-outline",
+  "mdi:bed-outline", "mdi:bed-single-outline", "mdi:bed-king-outline", "mdi:teddy-bear", "mdi:rocket-launch-outline",
+  "mdi:bathtub-outline", "mdi:shower", "mdi:toilet", "mdi:washing-machine", "mdi:hanger",
+  "mdi:desk", "mdi:laptop", "mdi:bookshelf", "mdi:dumbbell", "mdi:gamepad-variant-outline",
+  "mdi:door", "mdi:stairs", "mdi:home-floor-negative-1", "mdi:garage-variant", "mdi:tools",
+  "mdi:flower-outline", "mdi:pine-tree", "mdi:grill-outline", "mdi:pool", "mdi:car-outline",
+];
+// Eigene Fotos: längste Kante beim Hochladen – reicht fürs Tablet, schont Speicher und Netz.
+const ROOM_PHOTO_MAX = 1920;
+
+const ElvioRooms = {
+  // Slug-Varianten eines Namens: HA macht aus „ä“ ein „a“, die Bilder im Repo heißen „ae“.
+  slugs(name) {
+    const base = String(name || "").toLowerCase();
+    const make = (map) =>
+      base.replace(/[äöüß]/g, (ch) => map[ch]).replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+    return [...new Set([make({ ä: "ae", ö: "oe", ü: "ue", ß: "ss" }), make({ ä: "a", ö: "o", ü: "u", ß: "ss" })])].filter(Boolean);
+  },
+
+  // Bild aus dem Kartenpaket, wenn Name oder ID zu einer Datei passt („Garage“ → garage.jpg).
+  bundledImage(area) {
+    const keys = [...ElvioRooms.slugs(area.name), area.area_id];
+    const hit = keys.find((k) => BUNDLED_IMAGES.includes(k));
+    return hit ? `${IMAGE_BASE}${hit}.jpg` : null;
+  },
+
+  isLegacy(nav) {
+    return (nav || []).some((i) => i && i.room);
+  },
+
+  // Neuer Modus: Bereiche in Registry-Reihenfolge (so liefert HA hass.areas/hass.floors),
+  // sortiert nach Stockwerk; Bereiche ohne (bekanntes) Stockwerk ans Ende.
+  fromAreas(areas, floors, { basePath, hideLabel, includeHidden = false }) {
+    const floorIdx = new Map((floors || []).map((f, i) => [f.floor_id, i]));
+    const floorName = new Map((floors || []).map((f) => [f.floor_id, f.name]));
+    const pos = (a) => (floorIdx.has(a.floor_id) ? floorIdx.get(a.floor_id) : Number.MAX_SAFE_INTEGER);
+    return (areas || [])
+      .map((a, i) => ({ a, i, hidden: (a.labels || []).includes(hideLabel) }))
+      .filter((x) => includeHidden || !x.hidden)
+      .sort((x, y) => pos(x.a) - pos(y.a) || x.i - y.i)
+      .map(({ a, hidden }) => ({
+        areaId: a.area_id,
+        name: a.name,
+        icon: a.icon || "mdi:door",
+        image: a.picture || ElvioRooms.bundledImage(a),
+        temperature: a.temperature_entity_id || null,
+        floorId: floorIdx.has(a.floor_id) ? a.floor_id : null,
+        floorName: floorIdx.has(a.floor_id) ? floorName.get(a.floor_id) : null,
+        path: `${basePath}?bereich=${encodeURIComponent(a.area_id)}`,
+        lights: [],
+        hidden,
+      }));
+  },
+
+  // Altmodus: dieselbe Form aus nav; den Bereich findet resolveArea über den Namen.
+  fromNav(nav, resolveArea) {
+    return (nav || [])
+      .filter((i) => i && i.room)
+      .map((r) => ({
+        areaId: resolveArea(r.area || r.name),
+        name: r.name,
+        // Ohne Icon bleibt es leer wie bis v1.5.0: Musik-Chips zeigen dann den Lautsprecher.
+        icon: r.icon || null,
+        image: r.image || null,
+        temperature: r.temperature || null,
+        floorId: null,
+        floorName: null,
+        path: r.path,
+        lights: r.lights || [],
+        hidden: false,
+      }));
+  },
+
+  // Gruppen für die Raumübersicht (Räume sind schon nach Stockwerk sortiert). Eine einzige
+  // Gruppe braucht keine Überschrift.
+  groupByFloor(rooms) {
+    const groups = [];
+    for (const r of rooms) {
+      const key = r.floorId || null;
+      let g = groups.find((x) => x.floorId === key);
+      if (!g) {
+        g = { floorId: key, title: key ? r.floorName : "Weitere", rooms: [] };
+        groups.push(g);
+      }
+      g.rooms.push(r);
+    }
+    if (groups.length === 1) groups[0].title = null;
+    return groups;
+  },
+
+  areaFromLocation(search) {
+    return new URLSearchParams(search || "").get("bereich") || null;
+  },
+
+  // Adresse der gemeinsamen Raum-Ansicht: /<dashboard>/raum, außer rooms_path ist gesetzt.
+  roomsBasePath(pathname, override) {
+    if (override) return override;
+    const dash = String(pathname || "").split("/")[1] || "lovelace";
+    return `/${dash}/raum`;
+  },
+
+  swap(ids, a, b) {
+    const out = [...ids];
+    const i = out.indexOf(a);
+    const j = out.indexOf(b);
+    if (i < 0 || j < 0) return out;
+    [out[i], out[j]] = [out[j], out[i]];
+    return out;
+  },
+
+  // ── Umstellung alter Dashboards (Räume in nav → Räume aus HA) ──
+
+  // Kachel, die die Karte für eine Entität eines Raums von selbst baut (_autoTile nutzt das).
+  autoTile(id, name) {
+    const domain = String(id).split(".")[0];
+    if (domain === "light") return { type: "lights", entities: [id], name };
+    if (domain === "media_player") return { type: "media", entity: id };
+    if (domain === "camera") return { type: "camera", entity: id };
+    if (domain === "climate") return { type: "climate", entity: id };
+    if (domain === "switch" || domain === "fan") {
+      return { type: "toggle", entity: id, icon: domain === "fan" ? "mdi:fan" : "mdi:power-socket-de" };
+    }
+    return { type: "entity", entity: id };
+  },
+
+  // Vergleichbare Form eines Objekts: Schlüssel sortiert, ausgelassene und leere Schlüssel weg.
+  canon(obj, omit = []) {
+    const out = {};
+    for (const k of Object.keys(obj || {}).sort()) if (!omit.includes(k) && obj[k] !== undefined) out[k] = obj[k];
+    return JSON.stringify(out);
+  },
+
+  isRoomCardType(type) {
+    return type === "custom:elvio-room-card" || type === "custom:elvio-room-card-dev";
+  },
+
+  // Warum eine alte Raum-Ansicht nicht verlustfrei in die gemeinsame Ansicht passt (null = passt).
+  // Verlustfrei heißt: Die gemeinsame Ansicht zeigt dasselbe – jede Kachel genau so, wie die
+  // Karte sie im neuen Modus von selbst baut, und nur Entitäten, die sie dort von selbst einsammelt.
+  blockReason(view, areaId, ctx) {
+    const cards = view.cards || [];
+    if (cards.length !== 1 || !ElvioRooms.isRoomCardType(cards[0].type)) return "die Ansicht hat mehr als die Raumkarte";
+    const card = cards[0];
+    if ((card.sections || []).length) return "eigene Abschnitte (sections)";
+    if ((card.chips || []).length) return "eigene Chips";
+    const tiles = card.tiles || [];
+    if (tiles.filter((t) => t && t.type === "lights").length > 1) return "mehrere Licht-Kacheln";
+    for (const t of tiles) {
+      if (!t) return "leere Kachel";
+      let ids;
+      if (t.type === "lights") {
+        // Die gemeinsame Ansicht hat genau eine Licht-Kachel „Licht“ – ein anderer Name oder eigene
+        // Einstellungen gingen verloren.
+        if (t.name && t.name !== "Licht") return `Licht-Kachel „${t.name}“ hieße danach „Licht“`;
+        const extra = Object.keys(t).filter((k) => !["type", "name", "entities"].includes(k));
+        if (extra.length) return `Licht-Kachel hat eigene Einstellungen (${extra.join(", ")})`;
+        ids = t.entities || [];
+        // Die Automatik legt nur light.* in die Licht-Kachel; alles andere stünde danach woanders.
+        const notLight = ids.find((id) => !String(id).startsWith("light."));
+        if (notLight) return `${notLight} ist kein Licht`;
+      } else {
+        if (!t.entity || !AUTO_DOMAINS.includes(String(t.entity).split(".")[0])) {
+          return `Kachel „${t.name || t.type}“ erscheint nicht von selbst`;
+        }
+        if (ElvioRooms.canon(t) !== ElvioRooms.canon(ElvioRooms.autoTile(t.entity))) {
+          return `Kachel „${t.name || t.entity}“ sähe danach anders aus`;
+        }
+        ids = [t.entity];
+      }
+      for (const id of ids) {
+        if (!areaId) return "der Raum hat noch keinen Bereich, zeigt aber eigene Geräte";
+        if (ctx.entityArea(id) !== areaId) return `${id} gehört nicht zu diesem Raum`;
+        if (ctx.isCollected && !ctx.isCollected(id)) return `${id} erscheint nicht von selbst (versteckt oder technisch)`;
+      }
+    }
+    return null;
+  },
+
+  // Plan für die Umstellung – schreibt nichts. Liefert, was blockiert, welche Räume in welche
+  // Bereiche gehen und die neue Dashboard-Konfiguration (Raum-Ansichten → eine Ansicht raum).
+  // ctx: { resolveArea(key), entityArea(entityId), isCollected?(entityId),
+  //        isTemperatureSensor?(entityId), areaName?(areaId) }
+  migrationPlan(config, ctx) {
+    const views = config.views || [];
+    const cardOf = (v) => (Array.isArray(v.cards) ? v.cards[0] : undefined);
+    const first = views.map(cardOf).find((c) => c && ElvioRooms.isRoomCardType(c.type));
+    const nav = (first && first.nav) || [];
+    const navRooms = nav.filter((i) => i && i.room);
+    if (!navRooms.length) return { blocked: [{ room: "–", reason: "keine Räume in nav" }], rooms: [], config };
+    const plainNav = nav.filter((i) => !(i && i.room));
+    const clean = (p) => String(p || "").split("?")[0].replace(/\/+$/, "");
+    // Was je Raum verschieden sein darf. Alles andere muss in allen Raumkarten gleich sein – die
+    // gemeinsame Ansicht hat nur eine Raumkarte.
+    const ROOM_KEYS = ["area", "title", "background", "tiles", "sections", "temperature", "chips", "nav"];
+    const blocked = [];
+    const rooms = [];
+    const roomViews = [];
+    // Welcher Raum welchen Bereich schon belegt: Zwei Räume in einem Bereich wären danach einer.
+    const areaOwner = new Map();
+    for (const r of navRooms) {
+      const block = (reason) => blocked.push({ room: r.name, reason });
+      const vi = views.findIndex((v) => v.path && clean(r.path).endsWith(`/${v.path}`));
+      const areaId = ctx.resolveArea(r.area || r.name);
+      const card = vi >= 0 ? cardOf(views[vi]) : null;
+      if (vi < 0) block(`Ansicht nicht gefunden (${r.path})`);
+      if (areaId) {
+        if (areaOwner.has(areaId)) block(`teilt sich den Bereich mit „${areaOwner.get(areaId)}“`);
+        else areaOwner.set(areaId, r.name);
+        // Der Raum heißt danach wie sein Bereich – ein anderer Name am Tablet wäre eine stille Änderung.
+        const areaName = ctx.areaName ? ctx.areaName(areaId) : r.name;
+        if (areaName !== r.name) block(`hieße danach „${areaName}“ – Bereich in HA umbenennen oder Raum in nav anpassen`);
+      }
+      if (vi >= 0) {
+        roomViews.push(vi);
+        const why = ElvioRooms.blockReason(views[vi], areaId, ctx);
+        if (why) block(why);
+        else {
+          // Bereich so bestimmen, wie ihn die alte Ansicht fand (_areaId): area: oder gleichnamiger Raum.
+          const key = card.area || (navRooms.some((n) => n.name === card.title) ? card.title : null);
+          const viewArea = key ? ctx.resolveArea(key) : null;
+          if (viewArea !== areaId) block(`die Ansicht zeigt einen anderen Bereich (${key || "keinen"})`);
+          const tplCard = cardOf(views[roomViews[0]]);
+          if (ElvioRooms.canon(card, ROOM_KEYS) !== ElvioRooms.canon(tplCard, ROOM_KEYS)) {
+            block("die Raumkarte hat andere Einstellungen als die erste Raum-Ansicht");
+          }
+        }
+      }
+      const temperature = r.temperature || (card && card.temperature) || null;
+      if (temperature && !String(temperature).startsWith("sensor.")) {
+        block(`Temperatur ${temperature} lässt sich nicht übernehmen (HA nimmt nur Sensoren)`);
+      } else if (temperature && ctx.isTemperatureSensor && !ctx.isTemperatureSensor(temperature)) {
+        // HA lehnt am Bereich jeden Sensor ab, der keine Temperatur misst.
+        block(`Temperatur ${temperature} ist kein Temperatursensor`);
+      }
+      rooms.push({ name: r.name, areaId, icon: r.icon || null, image: r.image || (card && card.background) || null, temperature });
+    }
+    if (views.some((v, i) => v.path === "raum" && !roomViews.includes(i))) {
+      blocked.push({ room: "raum", reason: "es gibt schon eine Ansicht mit dem Pfad raum" });
+    }
+    // Vorlage für die gemeinsame Ansicht: die erste Raum-Ansicht ohne ihre raumeigenen Teile.
+    const tplView = roomViews.length ? views[roomViews[0]] : null;
+    const tpl = (tplView && cardOf(tplView)) || first;
+    const { area, title, background, tiles, sections, temperature, chips, ...base } = tpl;
+    const { title: _title, path: _path, cards: _cards, ...viewRest } = tplView || {};
+    const roomView = {
+      ...viewRest,
+      title: "Raum",
+      path: "raum",
+      type: "panel",
+      cards: [{ ...base, nav: plainNav, title: "Raum", area: "auto", tiles: [{ type: "lights", name: "Licht", entities: [] }] }],
+    };
+    // Jede übrige Raumkarte behält ihre eigene nav, nur ohne Räume.
+    const kept = views
+      .filter((_, i) => !roomViews.includes(i))
+      .map((v) =>
+        Array.isArray(v.cards)
+          ? {
+              ...v,
+              cards: v.cards.map((c) =>
+                c && ElvioRooms.isRoomCardType(c.type) && c.nav ? { ...c, nav: c.nav.filter((i) => !(i && i.room)) } : c,
+              ),
+            }
+          : v,
+      );
+    kept.splice(Math.min(1, kept.length), 0, roomView);
+    return { blocked, rooms, config: { ...config, views: kept } };
+  },
+
+  // Nur ergänzen, was der Bereich noch nicht hat. Temperatur nur von Sensoren – HA nimmt als
+  // Temperatur eines Bereichs nur einen Sensor (alte Dashboards erlaubten auch climate.*).
+  areaPatch(area, room) {
+    const patch = {};
+    if (!area.icon && room.icon) patch.icon = room.icon;
+    if (!area.picture && room.image) patch.picture = room.image;
+    if (!area.temperature_entity_id && room.temperature && room.temperature.startsWith("sensor.")) {
+      patch.temperature_entity_id = room.temperature;
+    }
+    return patch;
+  },
+
+  orderFirst(allIds, firstIds) {
+    const first = [...new Set(firstIds.filter((id) => allIds.includes(id)))];
+    return [...first, ...allIds.filter((id) => !first.includes(id))];
+  },
+
+  // Nach der Umstellung zeigt das Tablet alle Bereiche ohne Ausblende-Label. Damit es dieselben
+  // Räume zeigt wie vorher, bekommen die Bereiche, die bisher kein Raum waren, das Label.
+  areasToHide(allAreas, roomAreaIds, hideLabel) {
+    return (allAreas || [])
+      .filter((a) => !roomAreaIds.includes(a.area_id) && !(a.labels || []).includes(hideLabel))
+      .map((a) => a.area_id);
+  },
+
+  // ── Geräte hinzufügen (Kameras, Sensoren, Schalter …) ──
+
+  // Was sich einem Raum hinzufügen lässt: Bedienbares, Sensoren, Klingel/Taster. Keine
+  // Systemfunktionen (Updates, Einstellwerte) und nichts ohne Ort (Personen, Wetter …).
+  isPickable(id) {
+    return PICK_DOMAINS.includes(String(id).split(".")[0]);
+  },
+
+  // Vorausgewählt beim Hinzufügen und im Geräte-Blatt oben (statt unter „Messwerte & Technik“).
+  isUseful(id, deviceClass) {
+    const domain = String(id).split(".")[0];
+    if (AUTO_DOMAINS.includes(domain)) return true;
+    return (USEFUL_CLASSES[domain] || []).includes(deviceClass);
+  },
+
+  // Vorausgewählt beim Hinzufügen. Kameras bringen viel Beiwerk mit (Lautsprecher der
+  // Sprechanlage, „Rauchalarm gehört“ …): dort nur Bild, Klingel und Melder.
+  preselect(id, deviceClass, deviceKind) {
+    if (!ElvioRooms.isUseful(id, deviceClass)) return false;
+    if (deviceKind !== "camera") return true;
+    const domain = String(id).split(".")[0];
+    if (["media_player", "switch", "siren"].includes(domain)) return false;
+    return !(domain === "binary_sensor" && ALERT_CLASSES.includes(deviceClass));
+  },
+
+  // Filter in der Auswahl. null: zählt für die Art eines Geräts nicht (Taster, Knöpfe).
+  entityKind(id, deviceClass) {
+    const domain = String(id).split(".")[0];
+    if (domain === "camera" || (domain === "event" && deviceClass === "doorbell")) return "camera";
+    if (domain === "light") return "light";
+    if (domain === "switch" || domain === "fan") return "switch";
+    if (domain === "sensor" || domain === "binary_sensor") return "sensor";
+    if (domain === "event" || domain === "button") return null;
+    return "other";
+  },
+
+  // Art eines Geräts aus seinen Funktionen: eine Klingel mit Bewegungsmelder ist eine Kamera,
+  // ein Aktor mit Messwerten ein Schalter, ein Sensor nur, wenn sonst nichts da ist.
+  deviceKind(entities) {
+    const kinds = (entities || []).map((e) => ElvioRooms.entityKind(e.entity_id, e.device_class));
+    return ["camera", "light", "switch", "other", "sensor"].find((k) => kinds.includes(k)) || "other";
+  },
+
+  // Abschnitt in der Raum-Ansicht für automatisch gesammelte Geräte (Lichter: Licht-Kachel).
+  roomSection(id, deviceClass) {
+    const domain = String(id).split(".")[0];
+    if (domain === "camera") return "Kameras";
+    // Klingel und Taster stehen bei den Sensoren („Türklingel · vor 2 Std.“ neben „Haustür · zu“).
+    if (domain === "sensor" || domain === "binary_sensor" || domain === "event") return "Sensoren";
+    return "Weitere Geräte";
+  },
+
+  // Symbol für Sensoren, Melder und Ereignisse wie in HA (null: Symbol der Entität/Standard).
+  stateIcon(id, deviceClass, state) {
+    const domain = String(id).split(".")[0];
+    const icons = (STATE_ICONS[domain] || {})[deviceClass];
+    if (!icons) return null;
+    if (typeof icons === "string") return icons;
+    return state === "on" ? icons[0] : icons[1];
+  },
+
+  // Melder, die Alarm schlagen (Kachel wird rot): Rauch, Wasser, Gas …
+  isAlert(id, deviceClass, state) {
+    return String(id).startsWith("binary_sensor.") && ALERT_CLASSES.includes(deviceClass) && state === "on";
+  },
+
+  // Labels für „am Tablet zeigen“ – nur die Abweichung vom Normalfall wird gespeichert,
+  // fremde Labels bleiben.
+  shownLabels(labels, show, byDefault) {
+    const out = (labels || []).filter((l) => l !== LABEL_SHOW.id && l !== LABEL_HIDE.id);
+    if (show && !byDefault) out.push(LABEL_SHOW.id);
+    if (!show && byDefault) out.push(LABEL_HIDE.id);
+    return out;
+  },
+
+  // Plan fürs Hinzufügen – schreibt nichts. Ein Gerät ohne Raum zieht ganz in den Raum
+  // (wie in HA üblich); steht es schon woanders, kommen nur die gewählten Funktionen her
+  // (Mehrkanal-Aktoren: jeder Ausgang in seinem Raum). Gewähltes wird hier gezeigt,
+  // Abgewähltes, das hier landet, versteckt. Nur tatsächliche Änderungen stehen im Plan.
+  // device: { id, area_id } | null; entities: Registry-Einträge (entity_id, area_id, labels).
+  addPlan({ device, entities, selected, areaId, placed }) {
+    const deviceArea = device ? device.area_id || areaId : null;
+    const plan = { device: device && !device.area_id ? { device_id: device.id, area_id: areaId } : null, entities: [] };
+    const same = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+    for (const e of entities || []) {
+      const pick = (selected || []).includes(e.entity_id);
+      const own = e.area_id || null;
+      const area = pick ? (deviceArea === areaId ? null : areaId) : own;
+      if ((area || deviceArea) !== areaId) continue;
+      const byDefault = (placed || []).includes(e.entity_id) || AUTO_DOMAINS.includes(e.entity_id.split(".")[0]);
+      const labels = ElvioRooms.shownLabels(e.labels, pick, byDefault);
+      const change = { entity_id: e.entity_id };
+      if (area !== own) change.area_id = area;
+      if (!same(labels, e.labels || [])) change.labels = labels;
+      if (Object.keys(change).length > 1) plan.entities.push(change);
+    }
+    return plan;
+  },
+};
 
 // ───────────── Gegensprechen über SIP Core ─────────────
 // SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
@@ -443,7 +935,9 @@ class ElvioRoomCard extends HTMLElement {
     // ein-/ausgeblendet): Ansicht neu zusammenstellen. Nur dann – Zustandsänderungen
     // tauschen diese Objekte nicht aus.
     const regChanged =
-      !prev || hass.entities !== prev.entities || hass.devices !== prev.devices || hass.areas !== prev.areas;
+      !prev || hass.entities !== prev.entities || hass.devices !== prev.devices || hass.areas !== prev.areas || hass.floors !== prev.floors;
+    // Bereich umbenannt, verschoben, neu: die offene Raumübersicht baut ihre Kacheln neu.
+    if (prev && (hass.areas !== prev.areas || hass.floors !== prev.floors)) this._roomCards = null;
     if (regChanged) {
       const eff = this._effectiveConfig();
       const sig = JSON.stringify(eff);
@@ -459,6 +953,13 @@ class ElvioRoomCard extends HTMLElement {
     }
     if (!this._built) this._build();
     this._update();
+    this._maybePickRoom();
+    // Rückfall für die gemeinsame Raum-Ansicht: Hat die Karte einen Wechsel von ?bereich= nicht
+    // mitbekommen (HA hält Ansichten vor, abgehängt hört sie nichts), holt sie ihn hier nach.
+    if (this._rawConfig.area === "auto" && location.search !== this._lastSearch && this._onRoomsPath()) {
+      this._lastSearch = location.search;
+      this._locationChanged();
+    }
     // Offenes Bearbeiten-Blatt zeigt sofort den neuen Stand (auch wenn sich die Ansicht
     // selbst nicht geändert hat, z. B. ein ausgeblendeter Sensor zieht um).
     if (this._editWrap && !this._editWrap.hidden) {
@@ -471,18 +972,98 @@ class ElvioRoomCard extends HTMLElement {
   // bleiben, keine Einblend-Animation.
   _rebuildKeepingPlace() {
     const top = this._scroller ? this._scroller.scrollTop : 0;
-    const editing = this._editWrap && !this._editWrap.hidden && this._editMode === "devices";
+    const open = this._editWrap && !this._editWrap.hidden;
+    const editing = open && this._editMode === "devices";
+    const adding = open && this._editMode === "add" && !!this._addState;
+    const roomForm = open && this._editMode === "room" && !!this._roomDraft;
+    const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
     this._build(true);
     this._update();
     this._scroller.scrollTop = top;
     if (editing) this._openEdit();
+    if (adding) this._showAdd();
+    // Raumübersicht (auch im Bearbeiten-Modus) und Raum-Blatt mit Entwurf bleiben offen.
+    if (roomsOpen) {
+      this._roomsNavWrap.hidden = false;
+      this._roomCards = null;
+      this._renderRoomsNav();
+    }
+    if (roomForm) {
+      this._editMode = "room";
+      this._editActions.replaceChildren();
+      this._editWrap.hidden = false;
+      this._renderRoomForm();
+    }
+  }
+
+  // Anderer Raum in der Adresse: dieselbe Karte zeigt einen anderen Raum – mit derselben
+  // Einblendung wie ein Ansichtswechsel. HA meldet die neue Adresse, bevor es die Ansicht
+  // tauscht; erst danach prüfen, ob diese Karte überhaupt noch sichtbar ist.
+  _locationChanged() {
+    if (!this._hass || !this._rawConfig || this._rawConfig.area !== "auto") return;
+    setTimeout(() => {
+      if (!this.isConnected || !this._onRoomsPath()) return;
+      this._lastSearch = location.search;
+      const eff = this._effectiveConfig();
+      const sig = JSON.stringify(eff);
+      if (sig !== this._effSig) {
+        this._effSig = sig;
+        this._config = eff;
+        this._build();
+        this._update();
+      }
+      this._maybePickRoom();
+    }, 0);
+  }
+
+  // Ohne (gültigen) Raum in der Adresse: Raumübersicht öffnen – einmal je Adresse, damit sie
+  // nach dem Schließen nicht bei jeder Zustandsänderung wieder aufgeht.
+  _maybePickRoom() {
+    if (!this._rawConfig || this._rawConfig.area !== "auto" || !this._onRoomsPath() || this._autoRoom() || !this._roomsNavWrap) return;
+    const key = location.pathname + location.search;
+    if (this._pickedFor === key) return;
+    this._pickedFor = key;
+    this._openRoomsNav();
+  }
+
+  // Steht der Browser (noch) auf der Raum-Ansicht? Beim Wechsel nach „Zuhause“ meldet sich die
+  // verschwindende Raumkarte sonst noch einmal und öffnete die Raumübersicht.
+  _onRoomsPath() {
+    return location.pathname === ElvioRooms.roomsBasePath(location.pathname, this._config.rooms_path);
   }
 
   // ───────────── Räume aus HA-Bereichen ─────────────
 
+  // Eine Raumliste für alle Stellen (Leiste, Übersicht, Verschieben, Musik, Tablet-Raum).
+  // Altmodus: aus nav. Neuer Modus: aus den HA-Bereichen.
+  _rooms({ includeHidden = false } = {}) {
+    const nav = this._config.nav || [];
+    if (ElvioRooms.isLegacy(nav)) return ElvioRooms.fromNav(nav, (k) => this._resolveArea(k));
+    const hass = this._hass;
+    return ElvioRooms.fromAreas(Object.values(hass.areas || {}), Object.values(hass.floors || {}), {
+      basePath: ElvioRooms.roomsBasePath(location.pathname, this._config.rooms_path),
+      hideLabel: LABEL_HIDE.id,
+      includeHidden,
+    });
+  }
+
+  _isAdmin() {
+    return !!(this._hass && this._hass.user && this._hass.user.is_admin);
+  }
+
+  // Raum der gemeinsamen Raum-Ansicht (area: auto) aus ?bereich=… – nur sichtbare Räume.
+  _autoRoom() {
+    const id = ElvioRooms.areaFromLocation(location.search);
+    return (id && this._rooms().find((r) => r.areaId === id)) || null;
+  }
+
   // Bereich dieser Ansicht: `area:` in der Konfiguration, sonst der gleichnamige Raum aus
   // `nav` (Titel „Wohnbereich“ → Bereich „Wohnbereich“). Ohne Treffer: keine Automatik.
   _areaId(cfg = this._rawConfig) {
+    if (cfg.area === "auto") {
+      const room = this._autoRoom();
+      return room ? room.areaId : null;
+    }
     const key = cfg.area || ((cfg.nav || []).some((i) => i.room && i.name === cfg.title) ? cfg.title : null);
     return this._resolveArea(key);
   }
@@ -545,7 +1126,12 @@ class ElvioRoomCard extends HTMLElement {
   // Geräte des Raums kommen dazu (Lichter in die Licht-Kachel, der Rest unter „Weitere
   // Geräte“). Ohne Bereich und ohne Labels ist das Ergebnis die Konfiguration selbst.
   _effectiveConfig() {
-    const c = this._rawConfig;
+    let c = this._rawConfig;
+    // Gemeinsame Raum-Ansicht: Titel, Hintergrund und Temperatur kommen aus dem Bereich.
+    if (c.area === "auto") {
+      const room = this._autoRoom();
+      if (room) c = { ...c, title: room.name, background: room.image || c.background, temperature: room.temperature || c.temperature };
+    }
     const reg = this._hass.entities || {};
     const areaId = this._areaId();
     const hidden = new Set(
@@ -579,7 +1165,12 @@ class ElvioRoomCard extends HTMLElement {
       const lightTile = [...tiles, ...sections.flatMap((sec) => sec.tiles)].find((t) => t.type === "lights");
       if (lightTile) lightTile.entities = [...lightTile.entities, ...lights];
       else others.unshift(...lights);
-      if (others.length) sections.push({ title: "Weitere Geräte", tiles: others.map((id) => this._autoTile(id)) });
+      // Eigene Abschnitte je Art: Bedienbares, Kameras (mit Klingel), Sensoren.
+      const dc = (id) => (this._hass.states[id] || { attributes: {} }).attributes.device_class;
+      for (const title of ["Weitere Geräte", "Kameras", "Sensoren"]) {
+        const ids = others.filter((id) => ElvioRooms.roomSection(id, dc(id)) === title);
+        if (ids.length) sections.push({ title, tiles: ids.map((id) => this._autoTile(id)) });
+      }
     }
     tiles = tiles.filter(filled);
     sections = sections
@@ -589,13 +1180,7 @@ class ElvioRoomCard extends HTMLElement {
   }
 
   _autoTile(id) {
-    const domain = id.split(".")[0];
-    if (domain === "light") return { type: "lights", entities: [id], name: this._friendly(id) };
-    if (domain === "media_player") return { type: "media", entity: id };
-    if (domain === "camera") return { type: "camera", entity: id };
-    if (domain === "climate") return { type: "climate", entity: id };
-    if (domain === "switch" || domain === "fan") return { type: "toggle", entity: id, icon: domain === "fan" ? "mdi:fan" : "mdi:power-socket-de" };
-    return { type: "entity", entity: id };
+    return ElvioRooms.autoTile(id, this._friendly(id));
   }
 
   _friendly(id) {
@@ -606,7 +1191,7 @@ class ElvioRoomCard extends HTMLElement {
   // Lichter eines Raums für die Räume-Übersicht: eingetragene + dem Bereich zugeordnete.
   _roomLightIds(room) {
     const ids = new Set(room.lights || []);
-    const areaId = this._resolveArea(room.area || room.name);
+    const areaId = room.areaId;
     if (areaId) {
       const none = new Set();
       for (const e of this._areaEntities(areaId)) {
@@ -632,6 +1217,13 @@ class ElvioRoomCard extends HTMLElement {
     this._progressTimer = setInterval(() => this._tickProgress(), PROGRESS_TICK_MS);
     this._saverTimer = setInterval(() => this._checkSaver(), SAVER_CHECK_MS);
     this._lastActive = Date.now();
+    // Gemeinsame Raum-Ansicht: HA tauscht die Karte nicht aus, wenn nur ?bereich= wechselt.
+    this._onLocation = () => this._locationChanged();
+    window.addEventListener("location-changed", this._onLocation);
+    window.addEventListener("popstate", this._onLocation);
+    // HA hängt die vorgehaltene Raum-Ansicht wieder ein, ohne dass sie den Wechsel der Adresse
+    // gehört hat (sie war abgehängt): sonst stünde noch der vorige Raum da.
+    this._locationChanged();
     sipBridge.attach(this);
   }
 
@@ -642,6 +1234,10 @@ class ElvioRoomCard extends HTMLElement {
     clearInterval(this._saverTimer);
     clearInterval(this._saverPhotoTimer);
     // Ein laufendes Gespräch geht weiter – die nächste sichtbare Karte übernimmt das Popup.
+    window.removeEventListener("location-changed", this._onLocation);
+    window.removeEventListener("popstate", this._onLocation);
+    // Zurück auf /raum ohne Raum soll die Raumübersicht wieder aufgehen.
+    this._pickedFor = null;
     sipBridge.detach(this);
     this._closeDoorbell();
   }
@@ -696,9 +1292,8 @@ class ElvioRoomCard extends HTMLElement {
     // ist. Nur in Räumen mit HA-Bereich und nur für Admins – nur sie dürfen Labels und
     // Bereiche in HA ändern. Am Wandtablet: Dienste → Benutzer wechseln.
     if (this._areaId() && this._hass.user && this._hass.user.is_admin) {
-      const edit = el("button", "editbtn");
+      const edit = pillButton("mdi:pencil-outline", "Geräte");
       edit.setAttribute("aria-label", "Geräte bearbeiten");
-      edit.appendChild(icon("mdi:pencil-outline"));
       edit.addEventListener("click", () => this._openEdit());
       right.appendChild(edit);
     }
@@ -1382,7 +1977,9 @@ class ElvioRoomCard extends HTMLElement {
     // dass es sie gibt.
     if (hass.user && hass.user.is_admin && this._config.setup_hint !== false) {
       this._ensureSetup();
-      const open = setupCache ? setupCache.items.filter((i) => !i.done).length : 0;
+      // Die Umstellung auf Räume aus HA ist ein Angebot, keine fehlende Funktion: Sie steht in der
+      // Liste, zählt aber nicht mit – sonst bliebe der Chip an jedem alten Dashboard für immer.
+      const open = setupCache ? setupCache.items.filter((i) => !i.done && i.id !== "rooms").length : 0;
       if (open) chips.push({ id: "setup", kind: "entity", icon: "mdi:auto-fix", title: `${open} offen`, sub: "Einrichtung" });
     }
     const key = JSON.stringify(chips);
@@ -1486,7 +2083,14 @@ class ElvioRoomCard extends HTMLElement {
       return;
     }
     if (cfg.type === "tablet_room") {
-      const room = this._tabletRoom();
+      const stored = this._tabletRoom();
+      const wantedArea = this._tabletRoomArea();
+      const rooms = this._rooms();
+      // Ausgeblendeter Bereich: Name aus HA. Gespeicherter Name eines Raums aus nav (bis v1.5.0):
+      // so wie er ist. Unbekannte ID (Bereich gelöscht) oder Name: nicht festgelegt statt der ID.
+      const found = (wantedArea && rooms.find((r) => r.areaId === wantedArea)) || (stored && rooms.find((r) => r.name === stored));
+      const area = wantedArea && (this._hass.areas || {})[wantedArea];
+      const room = found ? found.name : area ? area.name : null;
       tile.name.textContent = cfg.name || "Tablet hängt in";
       tile.state.textContent = `${room || "Nicht festgelegt"} · nur dieses Gerät`;
       return;
@@ -1576,7 +2180,10 @@ class ElvioRoomCard extends HTMLElement {
           const track = [a.media_title, a.media_artist || a.media_series_title].filter(Boolean).join(" · ");
           if (active && track) tile.state.textContent = track;
         }
-        tile.node.classList.toggle("alert", st.state === "triggered" || st.state === "jammed");
+        tile.node.classList.toggle(
+          "alert",
+          st.state === "triggered" || st.state === "jammed" || ElvioRooms.isAlert(st.entity_id, st.attributes.device_class, st.state),
+        );
         if (tile.icon && !cfg.icon) tile.icon.setAttribute("icon", this._defaultIcon(st));
     }
   }
@@ -1702,7 +2309,9 @@ class ElvioRoomCard extends HTMLElement {
     }
     if (domain === "cover") return st.state === "closed" ? "mdi:window-shutter" : "mdi:window-shutter-open";
     if (domain === "media_player") return "mdi:speaker";
-    return st.attributes.icon || "mdi:information-outline";
+    if (domain === "camera") return st.attributes.icon || "mdi:cctv";
+    if (domain === "light") return st.attributes.icon || (st.state === "on" ? "mdi:lightbulb-on-outline" : "mdi:lightbulb-outline");
+    return st.attributes.icon || ElvioRooms.stateIcon(st.entity_id, st.attributes.device_class, st.state) || "mdi:information-outline";
   }
 
   _activeMode(st) {
@@ -2152,6 +2761,19 @@ class ElvioRoomCard extends HTMLElement {
         form: true,
       });
     }
+
+    // Altes Dashboard (Räume in nav): auf Räume aus HA umstellen. Prüft vor jedem Schreiben,
+    // sichert das Dashboard und baut erst danach um.
+    if (ElvioRooms.isLegacy(this._rawConfig.nav)) {
+      items.push({
+        id: "rooms",
+        icon: "mdi:floor-plan",
+        name: "Räume aus Home Assistant",
+        sub: "Räume am Tablet verwalten (anlegen, umbenennen, Bild). Das Dashboard wird vorher gesichert. Bereiche, die bisher nicht am Tablet waren, werden ausgeblendet (im Raum-Blatt wieder einblendbar).",
+        done: false,
+        run: (step) => this._migrateRooms(step, dash),
+      });
+    }
     return items;
   }
 
@@ -2253,6 +2875,114 @@ class ElvioRoomCard extends HTMLElement {
       this._editMsg.textContent = `${item.name}: ${setupErrText(err)}`;
       this._editMsg.hidden = false;
     }
+  }
+
+  async _migrateRooms(step, dash) {
+    const hass = this._hass;
+    const ws = (msg) => hass.callWS(msg);
+    const urlPath = dash === "lovelace" ? null : dash;
+
+    step("Prüfe das Dashboard …");
+    const dashboards = await ws({ type: "lovelace/dashboards/list" });
+    const meta = dashboards.find((d) => d.url_path === dash);
+    // Das Standard-Dashboard steht nicht in der Liste (und lovelace/info nennt nur den Ressourcen-Modus);
+    // dessen Modus steht im Panel von hass.
+    const panel = (hass.panels || {})[dash];
+    if ((meta && meta.mode === "yaml") || (panel && panel.config && panel.config.mode === "yaml")) throw new Error("YAML-Dashboard – bitte von Hand umstellen (README: Räume aus Home Assistant)");
+    const config = await ws({ type: "lovelace/config", url_path: urlPath });
+    const plan = ElvioRooms.migrationPlan(config, {
+      resolveArea: (k) => this._resolveArea(k),
+      entityArea: (id) => this._entityArea((hass.entities || {})[id]),
+      // Was die Automatik im neuen Modus einsammelt (_areaEntities): nicht versteckt, nicht technisch, mit Zustand.
+      isCollected: (id) => {
+        const e = (hass.entities || {})[id];
+        return !!(e && !e.hidden && !e.entity_category && hass.states[id]);
+      },
+      // Nur so einen Sensor nimmt HA als Temperatur eines Bereichs.
+      isTemperatureSensor: (id) => {
+        const st = hass.states[id];
+        return String(id).startsWith("sensor.") && !!(st && st.attributes && st.attributes.device_class === "temperature");
+      },
+      areaName: (areaId) => {
+        const a = (hass.areas || {})[areaId];
+        return a ? a.name : undefined;
+      },
+    });
+    if (plan.blocked.length) {
+      throw new Error(`nicht umgestellt – ${plan.blocked.map((b) => `${b.room}: ${b.reason}`).join("; ")}`);
+    }
+
+    // Sicherung zuerst: Erst wenn die Kopie gespeichert ist, wird irgendetwas geändert.
+    step("Sichere das Dashboard …");
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+    const taken = new Set(dashboards.map((d) => d.url_path));
+    const stem = `${dash === "lovelace" ? "uebersicht" : dash}-sicherung-${stamp}`;
+    let backup = stem;
+    for (let i = 2; taken.has(backup); i++) backup = `${stem}-${i}`;
+    const backupTitle = `${(meta && meta.title) || "Dashboard"} (Sicherung ${now.toLocaleDateString("de-DE")})`;
+    const backupDash = await ws({
+      type: "lovelace/dashboards/create",
+      url_path: backup,
+      title: backupTitle,
+      icon: "mdi:content-save-outline",
+      show_in_sidebar: false,
+      require_admin: true,
+      mode: "storage",
+    });
+    try {
+      await ws({ type: "lovelace/config/save", url_path: backup, config });
+    } catch (err) {
+      // Eine leere Sicherung wäre trügerisch: lieber wieder entfernen.
+      await ws({ type: "lovelace/dashboards/delete", dashboard_id: backupDash.id }).catch(() => null);
+      throw err;
+    }
+
+    try {
+      step("Übernehme die Räume …");
+      for (const room of plan.rooms) {
+        if (!room.areaId) {
+          const made = await ws({
+            type: "config/area_registry/create",
+            name: room.name,
+            icon: room.icon || undefined,
+            picture: room.image || undefined,
+            temperature_entity_id: room.temperature || undefined,
+          });
+          room.areaId = made.area_id;
+          continue;
+        }
+        const { temperature_entity_id, ...patch } = ElvioRooms.areaPatch((hass.areas || {})[room.areaId] || {}, room);
+        if (Object.keys(patch).length) await ws({ type: "config/area_registry/update", area_id: room.areaId, ...patch });
+        // Geprüft ist vorher, dass es ein Temperatursensor ist. Lehnt HA ihn trotzdem ab, bricht die
+        // Umstellung ab und die Meldung nennt die Sicherung – die Temperatur ginge sonst still verloren.
+        if (temperature_entity_id) {
+          await ws({ type: "config/area_registry/update", area_id: room.areaId, temperature_entity_id });
+        }
+      }
+
+      const areas = await ws({ type: "config/area_registry/list" });
+      const hide = ElvioRooms.areasToHide(areas, plan.rooms.map((r) => r.areaId), LABEL_HIDE.id);
+      if (hide.length) {
+        step("Blende Bereiche aus, die nicht am Tablet waren …");
+        await this._ensureLabels();
+        for (const a of areas.filter((x) => hide.includes(x.area_id))) {
+          await ws({ type: "config/area_registry/update", area_id: a.area_id, labels: [...(a.labels || []), LABEL_HIDE.id] });
+        }
+      }
+
+      step("Sortiere die Räume …");
+      const all = areas.map((a) => a.area_id);
+      await ws({ type: "config/area_registry/reorder", area_ids: ElvioRooms.orderFirst(all, plan.rooms.map((r) => r.areaId)) });
+
+      step("Baue das Dashboard um …");
+      await ws({ type: "lovelace/config/save", url_path: urlPath, config: plan.config });
+    } catch (err) {
+      throw new Error(
+        `${setupErrText(err)} – die Sicherung liegt unter „${backupTitle}“ (Einstellungen → Dashboards). Bereiche sind evtl. schon ergänzt; erneut „Einrichten“ ist gefahrlos.`,
+      );
+    }
+    return "reload";
   }
 
   _renderFuelSetup() {
@@ -2404,9 +3134,17 @@ class ElvioRoomCard extends HTMLElement {
     }
   }
 
-  _setTabletRoom(name) {
+  // Gespeichert wird die Bereichs-ID (bleibt beim Umbenennen gleich). Ältere Einträge mit dem
+  // Raumnamen werden weiter erkannt.
+  _tabletRoomArea() {
+    const v = this._tabletRoom();
+    if (!v) return null;
+    return this._hass.areas && this._hass.areas[v] ? v : this._resolveArea(v);
+  }
+
+  _setTabletRoom(value) {
     try {
-      if (name) window.localStorage.setItem(TABLET_ROOM_KEY, name);
+      if (value) window.localStorage.setItem(TABLET_ROOM_KEY, value);
       else window.localStorage.removeItem(TABLET_ROOM_KEY);
     } catch (err) {
       this._editMsg.textContent = `Nicht gespeichert: ${err.message || err}`;
@@ -2427,18 +3165,18 @@ class ElvioRoomCard extends HTMLElement {
       "Die Live-Karte bei Musik zeigt dann diesen Raum. Gilt nur für dieses Gerät, nicht für Handys oder andere Tablets.";
     const list = this._editList;
     list.innerHTML = "";
-    const cur = this._tabletRoom();
-    const rooms = (this._config.nav || []).filter((r) => r.room);
-    for (const r of [...rooms, { name: null, icon: "mdi:cellphone" }]) {
+    const cur = this._tabletRoomArea();
+    const rooms = this._rooms().filter((r) => r.areaId);
+    for (const r of [...rooms, { areaId: null, name: null, icon: "mdi:cellphone" }]) {
       const row = el("button", "erow epick");
       const ic = el("div", "eicon");
       ic.appendChild(icon(r.icon || "mdi:door"));
       row.append(ic, el("div", "etext sname", r.name || "Nirgends (Handy, unterwegs)"));
-      if ((r.name || null) === cur) {
+      if ((r.areaId || null) === cur) {
         row.classList.add("current");
         row.appendChild(el("div", "ssub", "gewählt"));
       }
-      row.addEventListener("click", () => this._setTabletRoom(r.name));
+      row.addEventListener("click", () => this._setTabletRoom(r.areaId));
       list.appendChild(row);
     }
   }
@@ -2457,8 +3195,8 @@ class ElvioRoomCard extends HTMLElement {
     const rank = (st) =>
       st.state === "playing" ? 3 : st.state === "paused" || st.state === "buffering" ? 2 : st.attributes.mass_player_type !== undefined ? 1 : 0;
     const out = [];
-    for (const room of (this._config.nav || []).filter((r) => r.room)) {
-      const areaId = this._resolveArea(room.area || room.name);
+    for (const room of this._rooms()) {
+      const areaId = room.areaId;
       if (!areaId) continue;
       const mine = players.filter((st) => this._entityArea(hass.entities && hass.entities[st.entity_id]) === areaId);
       if (!mine.length) continue;
@@ -2470,8 +3208,8 @@ class ElvioRoomCard extends HTMLElement {
 
   _updateNowPlaying(tile) {
     const rooms = this._musicRooms();
-    const wanted = this._tabletRoom();
-    const room = wanted ? rooms.find((r) => r.name === wanted) : null;
+    const wanted = this._tabletRoomArea();
+    const room = wanted ? rooms.find((r) => r.areaId === wanted) : null;
     // Raum des Tablets: dessen Player, auch wenn dort nichts läuft. Sonst wie bisher: was
     // gerade irgendwo läuft.
     const st = room ? room.st : this._pickPlayer();
@@ -3557,6 +4295,17 @@ class ElvioRoomCard extends HTMLElement {
 
   _navItems() {
     const all = this._config.nav || [];
+    if (!ElvioRooms.isLegacy(all)) {
+      // Neuer Modus: „Räume“ direkt hinter dem ersten Eintrag (meist Zuhause).
+      const base = ElvioRooms.roomsBasePath(location.pathname, this._config.rooms_path);
+      const items = all.map((item) => ({ ...item, active: this._isCurrent(item.path) }));
+      // Karten ohne nav (Beispiel bis v1.5.0) bleiben ohne Leiste – sonst stünde dort plötzlich
+      // „Räume“ mit Verweisen auf eine Ansicht raum, die es in diesem Dashboard nicht gibt.
+      if (all.length && this._rooms().length) {
+        items.splice(Math.min(1, items.length), 0, { name: "Räume", icon: "mdi:floor-plan", rooms: true, active: this._isCurrent(base) });
+      }
+      return items;
+    }
     const rooms = all.filter((i) => i.room);
     const items = [];
     let roomsAdded = false;
@@ -3585,8 +4334,22 @@ class ElvioRoomCard extends HTMLElement {
     const panel = el("div", "spanel rpanel");
     const head = el("div", "shead");
     head.appendChild(el("div", "ptitle", "Räume"));
+    // Räume verwalten: nur Admins (HA lässt Bereiche nur sie ändern) und nur, wenn die Räume
+    // aus HA kommen – im Altmodus stehen sie in nav, ein Bereich änderte dort nichts.
+    const actions = el("div", "sactions");
+    this._roomsEditBtn = pillButton("mdi:pencil-outline", "Bearbeiten");
+    this._roomsEditBtn.hidden = true;
+    this._roomsEditBtn.addEventListener("click", () => {
+      this._roomsEditing = !this._roomsEditing;
+      this._roomCards = null;
+      this._renderRoomsNav();
+    });
+    actions.appendChild(this._roomsEditBtn);
+    head.appendChild(actions);
+    this._roomsMsg = el("div", "emsg");
+    this._roomsMsg.hidden = true;
     this._roomGrid = el("div", "roomgrid");
-    panel.append(head, this._roomGrid, this._backButton(() => (wrap.hidden = true)));
+    panel.append(head, this._roomsMsg, this._roomGrid, this._backButton(() => (wrap.hidden = true)));
     wrap.appendChild(panel);
     wrap.addEventListener("click", (e) => {
       if (e.target === wrap) wrap.hidden = true;
@@ -3597,6 +4360,8 @@ class ElvioRoomCard extends HTMLElement {
 
   _openRoomsNav() {
     this._roomsNavWrap.hidden = false;
+    this._roomsEditing = false;
+    this._roomsMsg.hidden = true;
     this._roomCards = null;
     this._renderRoomsNav();
   }
@@ -3604,33 +4369,77 @@ class ElvioRoomCard extends HTMLElement {
   _renderRoomsNav() {
     if (!this._roomsNavWrap || this._roomsNavWrap.hidden) return;
     const hass = this._hass;
-    const rooms = (this._config.nav || []).filter((i) => i.room);
+    const canEdit = this._isAdmin() && !ElvioRooms.isLegacy(this._config.nav);
+    const editing = canEdit && !!this._roomsEditing;
+    this._roomsEditBtn.hidden = !canEdit;
+    setPill(this._roomsEditBtn, editing ? "mdi:check" : "mdi:pencil-outline", editing ? "Fertig" : "Bearbeiten");
+    this._roomsEditBtn.classList.toggle("on", editing);
     if (!this._roomCards) {
       this._roomGrid.innerHTML = "";
-      this._roomCards = rooms.map((room) => {
-        const card = el("button", "roomcard");
-        if (this._isCurrent(room.path)) card.classList.add("current");
-        const img = el("img", "rc-img");
-        img.alt = "";
-        if (room.image) img.src = room.image;
-        const txt = el("div", "rc-text");
-        const name = el("div", "rc-name", room.name);
-        const status = el("div", "rc-status");
-        txt.append(name, status);
-        const ic = el("div", "rc-icon");
-        ic.appendChild(icon(room.icon || "mdi:door"));
-        card.append(img, txt, ic);
-        card.addEventListener("click", () => {
-          this._roomsNavWrap.hidden = true;
-          this._navigate(room.path);
+      this._roomGrid.classList.toggle("editing", editing);
+      const here = this._areaId();
+      this._roomCards = [];
+      const groups = ElvioRooms.groupByFloor(this._rooms({ includeHidden: editing }));
+      if (editing && !groups.length) groups.push({ floorId: null, title: null, rooms: [] });
+      for (const group of groups) {
+        if (group.title) this._roomGrid.appendChild(el("div", "rgroup", group.title));
+        group.rooms.forEach((room, i) => {
+          // Im Bearbeiten-Modus ein div: Die Pfeile darin sind eigene Knöpfe.
+          const card = el(editing ? "div" : "button", "roomcard");
+          if (this._isCurrent(room.path) || (room.areaId && room.areaId === here)) card.classList.add("current");
+          if (room.hidden) card.classList.add("hiddenroom");
+          const img = el("img", "rc-img");
+          img.alt = "";
+          if (room.image) img.src = room.image;
+          const txt = el("div", "rc-text");
+          const status = el("div", "rc-status");
+          txt.append(el("div", "rc-name", room.name), status);
+          const ic = el("div", "rc-icon");
+          ic.appendChild(icon(room.icon || "mdi:door"));
+          card.append(img, txt, ic);
+          if (editing) {
+            card.addEventListener("click", () => this._openRoomForm(room.areaId));
+            // Pfeile statt Ziehen: am Wandtablet treffsicherer. Nur innerhalb des Stockwerks.
+            const moves = el("div", "rc-move");
+            for (const [name, label, other] of [
+              ["mdi:chevron-left", "Nach vorne", group.rooms[i - 1]],
+              ["mdi:chevron-right", "Nach hinten", group.rooms[i + 1]],
+            ]) {
+              const b = el("button", "rc-arrow");
+              b.setAttribute("aria-label", label);
+              b.appendChild(icon(name));
+              b.disabled = !other;
+              b.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                if (other) this._swapRooms(room.areaId, other.areaId);
+              });
+              moves.appendChild(b);
+            }
+            card.appendChild(moves);
+          } else {
+            card.addEventListener("click", () => {
+              this._roomsNavWrap.hidden = true;
+              this._navigate(room.path);
+            });
+          }
+          card.style.setProperty("--i", String(this._roomGrid.children.length));
+          this._roomGrid.appendChild(card);
+          this._roomCards.push({ room, status });
         });
-        card.style.setProperty("--i", String(this._roomGrid.children.length));
-        this._roomGrid.appendChild(card);
-        return { room, status };
-      });
+        if (editing) {
+          const add = el("button", "roomcard roomadd");
+          add.append(icon("mdi:plus"), el("span", "", "Raum hinzufügen"));
+          add.addEventListener("click", () => this._openRoomForm(null, group.floorId));
+          this._roomGrid.appendChild(add);
+        }
+      }
     }
     // Live-Status je Raum: Lichter an, Temperatur.
     for (const { room, status } of this._roomCards) {
+      if (room.hidden) {
+        status.textContent = "Am Tablet ausgeblendet";
+        continue;
+      }
       const parts = [];
       const lights = this._roomLightIds(room).map((id) => hass.states[id]).filter(Boolean);
       if (lights.length) {
@@ -3643,6 +4452,354 @@ class ElvioRoomCard extends HTMLElement {
         if (Number.isFinite(v)) parts.push(`${Math.round(v)}°`);
       }
       status.textContent = parts.join(" · ");
+    }
+  }
+
+  // Reihenfolge: HA verlangt beim Umsortieren immer alle Bereiche – frisch holen, zwei tauschen.
+  async _swapRooms(a, b) {
+    this._roomsMsg.hidden = true;
+    try {
+      const list = await this._hass.callWS({ type: "config/area_registry/list" });
+      const ids = list.map((x) => x.area_id);
+      await this._hass.callWS({ type: "config/area_registry/reorder", area_ids: ElvioRooms.swap(ids, a, b) });
+    } catch (err) {
+      this._roomsMsg.textContent = `Nicht verschoben: ${setupErrText(err)}`;
+      this._roomsMsg.hidden = false;
+    }
+  }
+
+  // ───────────── Raum-Blatt ─────────────
+  // Der Entwurf liegt am Objekt, damit er einen Neuaufbau übersteht (jede Registry-Änderung
+  // kann die Karte neu aufbauen, siehe _rebuildKeepingPlace).
+
+  _openRoomForm(areaId, floorId = null) {
+    const a = areaId && (this._hass.areas || {})[areaId];
+    this._roomDraft = a
+      ? {
+          areaId,
+          name: a.name,
+          floorId: a.floor_id || null,
+          icon: a.icon || "mdi:door",
+          picture: a.picture || null,
+          temperature: a.temperature_entity_id || null,
+          shown: !(a.labels || []).includes(LABEL_HIDE.id),
+          labels: a.labels || [],
+        }
+      : { areaId: null, name: "", floorId, icon: "mdi:door", picture: null, temperature: null, shown: true, labels: [] };
+    this._roomFormView = "main";
+    this._editMode = "room";
+    this._editActions.replaceChildren();
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderRoomForm();
+  }
+
+  _roomFormError(text) {
+    this._editMsg.textContent = text;
+    this._editMsg.hidden = false;
+  }
+
+  _renderRoomForm() {
+    if (this._editMode !== "room" || this._editWrap.hidden || !this._roomDraft) return;
+    const d = this._roomDraft;
+    const list = this._editList;
+    list.innerHTML = "";
+    if (this._roomFormView === "icon") return this._renderIconPick();
+    if (this._roomFormView === "delete") return this._renderRoomDelete();
+    if (this._roomFormView === "image") return this._renderImagePick();
+    this._editTitle.textContent = d.areaId ? "Raum bearbeiten" : "Neuer Raum";
+    this._editHint.textContent = "Gespeichert wird in Home Assistant – Updates ändern daran nichts.";
+
+    const name = el("input", "einput");
+    name.value = d.name;
+    name.placeholder = "Name, z. B. Büro";
+    name.addEventListener("input", () => (d.name = name.value));
+    list.append(el("div", "esub", "Name"), name);
+
+    const floors = Object.values(this._hass.floors || {});
+    if (floors.length) {
+      const chips = el("div", "echips");
+      for (const f of [...floors, { floor_id: null, name: "Kein Stockwerk" }]) {
+        const b = el("button", "echip", f.name);
+        b.classList.toggle("on", (d.floorId || null) === (f.floor_id || null));
+        b.addEventListener("click", () => {
+          d.floorId = f.floor_id || null;
+          this._renderRoomForm();
+        });
+        chips.appendChild(b);
+      }
+      list.append(el("div", "esub", "Stockwerk"), chips);
+    }
+
+    // Zeile, die eine Auswahl (Icon, Bild) öffnet.
+    const pick = (label, view, preview) => {
+      const row = el("button", "erow epick");
+      const ic = el("div", "eicon");
+      ic.appendChild(preview);
+      row.append(ic, el("div", "etext sname", label), el("div", "ssub", "Ändern"));
+      row.addEventListener("click", () => {
+        this._roomFormView = view;
+        this._renderRoomForm();
+      });
+      return row;
+    };
+    // Ohne eigenes Bild gilt das Ersatzbild aus dem Kartenpaket – dieselbe Regel wie am Tablet.
+    const fallback = d.picture ? null : ElvioRooms.bundledImage({ area_id: d.areaId, name: d.name });
+    const shown = d.picture || fallback;
+    let preview = icon("mdi:image-off-outline");
+    if (shown) {
+      preview = el("img", "ethumb");
+      preview.alt = "";
+      preview.src = shown;
+    }
+    list.append(
+      el("div", "esub", "Aussehen"),
+      pick("Icon", "icon", icon(d.icon)),
+      pick(d.picture ? "Bild" : fallback ? "Bild: automatisch" : "Bild: keins", "image", preview),
+    );
+
+    if (d.areaId) {
+      const temps = this._temperatureSensors(d.areaId);
+      if (temps.length) {
+        const chips = el("div", "echips");
+        for (const id of [...temps, null]) {
+          const b = el("button", "echip", id ? this._friendly(id) : "Keine");
+          b.classList.toggle("on", (d.temperature || null) === id);
+          b.addEventListener("click", () => {
+            d.temperature = id;
+            this._renderRoomForm();
+          });
+          chips.appendChild(b);
+        }
+        list.append(el("div", "esub", "Temperatur"), chips);
+      }
+    }
+
+    const show = el("div", "erow");
+    const sw = el("button", "lswitch");
+    sw.classList.toggle("on", d.shown);
+    sw.setAttribute("aria-label", d.shown ? "Ausblenden" : "Am Tablet zeigen");
+    sw.addEventListener("click", () => {
+      d.shown = !d.shown;
+      this._renderRoomForm();
+    });
+    show.append(el("div", "etext sname", "Am Tablet zeigen"), sw);
+    list.appendChild(show);
+
+    const save = el("button", "pbtn unlock esave", d.areaId ? "Speichern" : "Raum anlegen");
+    save.addEventListener("click", () => this._saveRoom(save));
+    list.appendChild(save);
+    if (d.areaId) {
+      const del = el("button", "stextbtn edanger", "Raum löschen");
+      del.addEventListener("click", () => {
+        this._roomFormView = "delete";
+        this._renderRoomForm();
+      });
+      list.appendChild(del);
+    }
+  }
+
+  // Temperatursensoren im Bereich (direkt oder über ihr Gerät) – Auswahl für die Statuszeile.
+  _temperatureSensors(areaId) {
+    const hass = this._hass;
+    return Object.values(hass.entities || {})
+      .filter((e) => e.entity_id.startsWith("sensor.") && this._entityArea(e) === areaId)
+      .filter((e) => {
+        const st = hass.states[e.entity_id];
+        return st && st.attributes.device_class === "temperature";
+      })
+      .map((e) => e.entity_id);
+  }
+
+  _renderIconPick() {
+    const d = this._roomDraft;
+    this._editTitle.textContent = "Icon wählen";
+    this._editHint.textContent = "";
+    const grid = el("div", "iconpick");
+    for (const name of ROOM_ICONS) {
+      const b = el("button", "ipick");
+      b.classList.toggle("on", d.icon === name);
+      b.setAttribute("aria-label", name.replace("mdi:", ""));
+      b.appendChild(icon(name));
+      b.addEventListener("click", () => {
+        d.icon = name;
+        this._roomFormView = "main";
+        this._renderRoomForm();
+      });
+      grid.appendChild(b);
+    }
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      this._roomFormView = "main";
+      this._renderRoomForm();
+    });
+    this._editList.append(grid, back);
+  }
+
+  _renderImagePick() {
+    const d = this._roomDraft;
+    this._editTitle.textContent = "Bild wählen";
+    this._editHint.textContent = "Eigenes Foto: Am Tablet öffnet sich die Kamera oder die Fotos.";
+    const grid = el("div", "imgpick");
+    const choose = (url) => {
+      d.picture = url;
+      this._roomFormView = "main";
+      this._renderRoomForm();
+    };
+    // label statt button: Ein Tipp öffnet die Dateiauswahl ohne eigenes Skript.
+    const own = el("label", "impick imtext");
+    const input = el("input");
+    input.type = "file";
+    input.accept = "image/*";
+    const ownText = el("span", "", "Eigenes Foto");
+    input.addEventListener("change", async () => {
+      const file = input.files && input.files[0];
+      if (!file) return;
+      // Leeren, damit dieselbe Datei nach einem Fehler erneut gewählt werden kann (sonst kein change).
+      input.value = "";
+      own.classList.add("busy");
+      ownText.textContent = "Lade hoch …";
+      try {
+        const url = await this._uploadRoomPhoto(file);
+        // Wurde inzwischen abgebrochen oder der Raum gewechselt, bleibt das Bild unberührt.
+        if (this._roomFormView !== "image" || this._roomDraft !== d) return;
+        choose(url);
+      } catch (err) {
+        if (this._roomFormView !== "image" || this._roomDraft !== d) return;
+        own.classList.remove("busy");
+        ownText.textContent = "Eigenes Foto";
+        this._roomFormError(`Foto nicht hochgeladen: ${setupErrText(err)}`);
+      }
+    });
+    own.append(input, icon("mdi:camera-outline"), ownText);
+    const none = el("button", "impick imtext");
+    none.classList.toggle("on", !d.picture);
+    none.append(icon("mdi:image-off-outline"), el("span", "", "Kein Bild"));
+    none.addEventListener("click", () => choose(null));
+    grid.append(own, none);
+    for (const name of BUNDLED_IMAGES) {
+      const url = `${IMAGE_BASE}${name}.jpg`;
+      const b = el("button", "impick");
+      b.classList.toggle("on", d.picture === url);
+      const img = el("img");
+      img.alt = "";
+      img.loading = "lazy";
+      img.src = url;
+      b.appendChild(img);
+      b.addEventListener("click", () => choose(url));
+      grid.appendChild(b);
+    }
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      this._roomFormView = "main";
+      this._renderRoomForm();
+    });
+    this._editList.append(grid, back);
+  }
+
+  // Foto verkleinern (längste Kante ROOM_PHOTO_MAX) und über HAs Bild-Upload ablegen – derselbe
+  // Weg wie Bereichsbilder in der HA-Oberfläche. Die Adresse lädt ohne Anmeldung, taugt also
+  // als Hintergrund. Ein ersetztes Foto bleibt in HA liegen (Einstellungen → Bereiche zeigt es nicht mehr).
+  async _uploadRoomPhoto(file) {
+    // Handyfotos liegen oft quer und tragen die Drehung nur in den EXIF-Daten.
+    const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+    const canvas = document.createElement("canvas");
+    // Das Bitmap hält viele Megapixel im Speicher: sofort nach dem Zeichnen freigeben.
+    try {
+      const scale = Math.min(1, ROOM_PHOTO_MAX / Math.max(bitmap.width, bitmap.height));
+      canvas.width = Math.round(bitmap.width * scale);
+      canvas.height = Math.round(bitmap.height * scale);
+      const ctx = canvas.getContext("2d");
+      // JPEG kennt keine Transparenz: erst weiß füllen, sonst werden PNGs schwarz.
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    } finally {
+      bitmap.close();
+    }
+    const blob = await new Promise((resolve, reject) =>
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Bild ließ sich nicht umwandeln"))), "image/jpeg", 0.85),
+    );
+    const form = new FormData();
+    form.append("file", blob, "raum.jpg");
+    const resp = await this._hass.fetchWithAuth("/api/image/upload", { method: "POST", body: form });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!data || !data.id) throw new Error("Antwort ohne Bild-ID");
+    return `/api/image/serve/${data.id}/original`;
+  }
+
+  _renderRoomDelete() {
+    const d = this._roomDraft;
+    const hass = this._hass;
+    // Geräte des Bereichs plus Entitäten ohne Gerät, die direkt im Bereich stehen.
+    const n =
+      Object.values(hass.devices || {}).filter((x) => x.area_id === d.areaId).length +
+      Object.values(hass.entities || {}).filter((e) => !e.device_id && e.area_id === d.areaId).length;
+    this._editTitle.textContent = "Raum löschen";
+    this._editHint.textContent = "";
+    const box = el("div", "cbox");
+    box.append(
+      icon("mdi:delete-outline"),
+      el("div", "ctitle", `„${d.name}“ löschen?`),
+      el(
+        "div",
+        "ctext",
+        n
+          ? `${n} ${n === 1 ? "Gerät ist" : "Geräte sind"} dann ohne Raum und lassen sich unter „Geräte bearbeiten“ neu zuordnen.`
+          : "Diesem Raum ist nichts zugeordnet.",
+      ),
+    );
+    const go = el("button", "pbtn edangerbtn", "Löschen");
+    go.addEventListener("click", () => this._deleteRoom(go));
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      this._roomFormView = "main";
+      this._renderRoomForm();
+    });
+    box.append(go, back);
+    this._editList.appendChild(box);
+  }
+
+  async _saveRoom(button) {
+    const d = this._roomDraft;
+    const name = d.name.trim();
+    if (!name) return this._roomFormError("Bitte einen Namen eingeben.");
+    this._editMsg.hidden = true;
+    button.disabled = true;
+    const labels = new Set(d.labels);
+    if (d.shown) labels.delete(LABEL_HIDE.id);
+    else labels.add(LABEL_HIDE.id);
+    const data = { name, floor_id: d.floorId, icon: d.icon, picture: d.picture, labels: [...labels] };
+    try {
+      if (!d.shown) await this._ensureLabels();
+      if (d.areaId) {
+        await this._hass.callWS({ type: "config/area_registry/update", area_id: d.areaId, ...data, temperature_entity_id: d.temperature });
+      } else {
+        await this._hass.callWS({ type: "config/area_registry/create", ...data });
+      }
+      this._roomDraft = null;
+      this._editWrap.hidden = true;
+    } catch (err) {
+      button.disabled = false;
+      this._roomFormError(`Nicht gespeichert: ${setupErrText(err)}`);
+    }
+  }
+
+  async _deleteRoom(button) {
+    const d = this._roomDraft;
+    button.disabled = true;
+    try {
+      await this._hass.callWS({ type: "config/area_registry/delete", area_id: d.areaId });
+      this._roomDraft = null;
+      this._editWrap.hidden = true;
+      // Zeigt die Raum-Ansicht gerade diesen Raum, geht es zur Raumübersicht.
+      if (this._rawConfig.area === "auto" && ElvioRooms.areaFromLocation(location.search) === d.areaId) {
+        this._navigate(ElvioRooms.roomsBasePath(location.pathname, this._config.rooms_path));
+      }
+    } catch (err) {
+      button.disabled = false;
+      this._roomFormError(`Nicht gelöscht: ${setupErrText(err)}`);
     }
   }
 
@@ -3783,10 +4940,14 @@ class ElvioRoomCard extends HTMLElement {
       this._confirmPath = "/config/integrations/dashboard";
       this._confirmWrap.hidden = false;
     });
+    // Hinzufügen: Kameras, Sensoren und Geräte aus dem ganzen Haus in diesen Raum holen.
+    const add = pillButton("mdi:plus", "Hinzufügen");
+    add.addEventListener("click", () => this._openAdd());
     const actions = el("div", "sactions");
-    actions.appendChild(pair);
+    actions.append(add, pair);
     head.append(this._editTitle, actions);
     this._editActions = actions;
+    this._editAddBtn = add;
     this._editPairBtn = pair;
     this._editHint = el("div", "ehint", "Was hier an ist, erscheint am Tablet. Gespeichert wird in Home Assistant – Updates ändern daran nichts.");
     this._editMsg = el("div", "emsg");
@@ -3803,7 +4964,7 @@ class ElvioRoomCard extends HTMLElement {
 
   _openEdit() {
     this._editMode = "devices";
-    this._editActions.replaceChildren(this._editPairBtn);
+    this._editActions.replaceChildren(this._editAddBtn, this._editPairBtn);
     this._editWrap.hidden = false;
     this._renderEdit();
   }
@@ -3813,7 +4974,7 @@ class ElvioRoomCard extends HTMLElement {
     const areaId = this._areaId();
     if (!areaId) return;
     this._editHint.textContent = "Was hier an ist, erscheint am Tablet. Gespeichert wird in Home Assistant – Updates ändern daran nichts.";
-    this._editTitle.textContent = `Geräte · ${this._rawConfig.title}`;
+    this._editTitle.textContent = `Geräte · ${this._config.title}`;
     const placed = this._placedIds();
     const list = this._editList;
     list.innerHTML = "";
@@ -3823,28 +4984,35 @@ class ElvioRoomCard extends HTMLElement {
       const [x2, y2] = order(b);
       return x1 - x2 || y1.localeCompare(y2, "de");
     });
-    if (!entities.length) list.appendChild(el("div", "ehint", "Diesem Raum ist in Home Assistant noch nichts zugeordnet."));
+    if (!entities.length) {
+      list.appendChild(el("div", "ehint", "Diesem Raum ist noch nichts zugeordnet. Mit „+ Hinzufügen“ holst du Kameras, Sensoren und Geräte her."));
+    }
+    // Messwerte und Technik (Leistung, Energie, Eingänge …) eingeklappt, solange sie nicht
+    // am Tablet stehen – sonst stehen allein für einen Aktor mit vier Kanälen 16 Zeilen da.
+    const tech = [];
     for (const e of entities) {
       const shown = this._isShown(e, placed);
-      const row = el("div", "erow");
-      const st = hass.states[e.entity_id];
-      const ic = el("div", "eicon");
-      ic.appendChild(icon(e.icon || (st && st.attributes.icon) || this._defaultIcon(st)));
-      const txt = el("div", "etext");
-      txt.append(el("div", "sname", this._friendly(e.entity_id)), el("div", "ssub", hass.formatEntityState(st)));
-      const move = el("button", "stextbtn emove", "Verschieben");
-      move.addEventListener("click", () => this._openMove(e));
-      const sw = el("button", "lswitch");
-      sw.classList.toggle("on", shown);
-      sw.setAttribute("aria-label", shown ? "Ausblenden" : "Am Tablet zeigen");
-      sw.addEventListener("click", () => this._setShown(e, !shown, placed));
-      row.append(ic, txt, move, sw);
-      list.appendChild(row);
+      if (!shown && !ElvioRooms.isUseful(e.entity_id, this._deviceClass(e.entity_id))) tech.push(e);
+      else list.appendChild(this._editRow(e, shown, placed));
+    }
+    if (tech.length) {
+      list.appendChild(this._foldButton(`Messwerte & Technik (${tech.length})`, !!this._editTechOpen, () => {
+        this._editTechOpen = !this._editTechOpen;
+        this._renderEdit();
+      }));
+      if (this._editTechOpen) for (const e of tech) list.appendChild(this._editRow(e, false, placed));
     }
     // Neu gekoppelte Geräte ohne Raum: mit einem Tipp in diesen Raum holen.
+    // Eingeklappt: Mehrkanal-Aktoren bringen je Kanal ein eigenes Gerät mit, das wären
+    // schnell zwanzig Zeilen. Alles andere holt „+ Hinzufügen“.
     const homeless = this._unassignedDevices();
     if (homeless.length) {
-      list.appendChild(el("div", "esub", "Ohne Raum"));
+      list.appendChild(this._foldButton(`Ohne Raum (${homeless.length})`, !!this._editHomelessOpen, () => {
+        this._editHomelessOpen = !this._editHomelessOpen;
+        this._renderEdit();
+      }));
+    }
+    if (homeless.length && this._editHomelessOpen) {
       for (const dev of homeless) {
         const row = el("div", "erow");
         const ic = el("div", "eicon");
@@ -3856,6 +5024,284 @@ class ElvioRoomCard extends HTMLElement {
         row.append(ic, txt, b);
         list.appendChild(row);
       }
+    }
+  }
+
+  _editRow(e, shown, placed) {
+    const hass = this._hass;
+    const row = el("div", "erow");
+    const st = hass.states[e.entity_id];
+    const ic = el("div", "eicon");
+    ic.appendChild(icon(e.icon || (st && st.attributes.icon) || this._defaultIcon(st)));
+    const txt = el("div", "etext");
+    txt.append(el("div", "sname", this._friendly(e.entity_id)), el("div", "ssub", hass.formatEntityState(st)));
+    const move = el("button", "stextbtn emove", "Verschieben");
+    move.addEventListener("click", () => this._openMove(e));
+    const sw = el("button", "lswitch");
+    sw.classList.toggle("on", shown);
+    sw.setAttribute("aria-label", shown ? "Ausblenden" : "Am Tablet zeigen");
+    sw.addEventListener("click", () => this._setShown(e, !shown, placed));
+    row.append(ic, txt, move, sw);
+    return row;
+  }
+
+  _foldButton(text, open, onClick) {
+    const b = el("button", "esub efold");
+    b.append(icon(open ? "mdi:chevron-down" : "mdi:chevron-right"), document.createTextNode(text));
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  _deviceClass(id) {
+    const st = this._hass.states[id];
+    return st ? st.attributes.device_class : undefined;
+  }
+
+  // ───────────── Hinzufügen: Kameras, Sensoren, Geräte aus dem ganzen Haus ─────────────
+  // Zwei Schritte im selben Blatt: Gerät suchen, dann seine Funktionen anhaken. Der Stand
+  // liegt in _addState, damit er einen Neuaufbau der Karte (Registry geändert) übersteht.
+
+  _openAdd() {
+    this._addState = { kind: "all", query: "", key: null, selected: null, techOpen: false };
+    this._showAdd();
+  }
+
+  _showAdd() {
+    this._editMode = "add";
+    // „Abbrechen“ geht einen Schritt zurück; „Zurück“ unten schließt wie überall das Blatt.
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      const s = this._addState;
+      if (s && s.key) {
+        s.key = null;
+        s.selected = null;
+        this._renderAdd();
+      } else {
+        this._addState = null;
+        this._openEdit();
+      }
+    });
+    this._editActions.replaceChildren(back);
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderAdd();
+  }
+
+  // Alles, was sich diesem Raum hinzufügen lässt: je Gerät eine Zeile, Entitäten ohne Gerät
+  // (z. B. Vorlagen-Sensoren) einzeln. Ohne Systemgeräte (Sonne, Backup …) und Technik.
+  _addCandidates() {
+    const hass = this._hass;
+    const areaId = this._areaId();
+    const devs = hass.devices || {};
+    const groups = new Map();
+    for (const e of Object.values(hass.entities || {})) {
+      if (e.hidden || e.entity_category || !hass.states[e.entity_id] || !ElvioRooms.isPickable(e.entity_id)) continue;
+      const d = e.device_id ? devs[e.device_id] : null;
+      if (d && (d.disabled_by || d.entry_type === "service")) continue;
+      const key = d ? `d:${d.id}` : `e:${e.entity_id}`;
+      if (!groups.has(key)) groups.set(key, { key, device: d || null, entities: [] });
+      groups.get(key).entities.push(e);
+    }
+    const out = [];
+    for (const g of groups.values()) {
+      const areas = [...new Set(g.entities.map((e) => this._entityArea(e) || null))];
+      const here = areas.length === 1 && areas[0] === areaId;
+      const names = areas
+        .map((a) => (a === areaId ? "hier" : a ? (hass.areas[a] && hass.areas[a].name) || a : "Ohne Raum"))
+        .sort((x, y) => (x === "Ohne Raum" ? -1 : y === "Ohne Raum" ? 1 : x.localeCompare(y, "de")));
+      const d = g.device;
+      // Teilgeräte (Kanäle eines Aktors, Kameras am Rekorder) heißen oft gleich („Reserve O3“):
+      // das übergeordnete Gerät (z. B. „EG-A4“) unterscheidet sie.
+      const via = d && d.via_device_id && devs[d.via_device_id];
+      out.push({
+        ...g,
+        name: d ? d.name_by_user || d.name || "Gerät" : this._friendly(g.entities[0].entity_id),
+        parent: via ? via.name_by_user || via.name || null : null,
+        offline: g.entities.every((e) => hass.states[e.entity_id].state === "unavailable"),
+        kind: ElvioRooms.deviceKind(g.entities.map((e) => ({ entity_id: e.entity_id, device_class: this._deviceClass(e.entity_id) }))),
+        where: here ? "Schon hier" : names.join(" · "),
+        rank: areas.includes(null) ? 0 : here ? 2 : 1,
+      });
+    }
+    return out.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name, "de"));
+  }
+
+  _renderAdd() {
+    const s = this._addState;
+    if (!s || !this._areaId()) return;
+    if (s.key) {
+      this._renderAddDevice();
+      return;
+    }
+    this._editTitle.textContent = `Hinzufügen · ${this._config.title}`;
+    this._editHint.textContent = "Kameras, Sensoren und Geräte aus dem ganzen Haus. Antippen zeigt, was davon hier erscheinen soll.";
+    const list = this._editList;
+    list.innerHTML = "";
+    const top = el("div", "eaddhead");
+    const field = el("label", "sfield");
+    field.appendChild(icon("mdi:magnify"));
+    const input = el("input", "sinput");
+    input.type = "search";
+    input.placeholder = "Gerät oder Raum suchen …";
+    input.value = s.query;
+    input.addEventListener("input", () => {
+      s.query = input.value;
+      this._renderAddResults();
+    });
+    field.appendChild(input);
+    const filters = el("div", "sfilters");
+    for (const f of ADD_FILTERS) {
+      const chip = el("button", "schip", f.label);
+      chip.classList.toggle("active", s.kind === f.key);
+      chip.addEventListener("click", () => {
+        s.kind = f.key;
+        for (const c of filters.children) c.classList.toggle("active", c === chip);
+        this._renderAddResults();
+      });
+      filters.appendChild(chip);
+    }
+    top.append(field, filters);
+    this._addResults = el("div", "eaddlist");
+    list.append(top, this._addResults);
+    this._renderAddResults();
+  }
+
+  _renderAddResults() {
+    const s = this._addState;
+    const box = this._addResults;
+    if (!s || !box) return;
+    const q = s.query.trim().toLowerCase();
+    const cands = this._addCandidates().filter(
+      (c) => (s.kind === "all" || c.kind === s.kind) && (!q || `${c.name} ${c.where} ${c.parent || ""}`.toLowerCase().includes(q)),
+    );
+    box.innerHTML = "";
+    if (!cands.length) box.appendChild(el("div", "smuted", q ? "Nichts gefunden." : "Hier gibt es nichts hinzuzufügen."));
+    for (const c of cands) {
+      const row = el("button", "erow epick");
+      const ic = el("div", "eicon");
+      ic.appendChild(icon(KIND_ICONS[c.kind] || "mdi:devices"));
+      const txt = el("div", "etext");
+      const sub = [c.where, c.parent, c.offline ? "nicht erreichbar" : null].filter(Boolean).join(" · ");
+      txt.append(el("div", "sname", c.name), el("div", "ssub", sub));
+      row.append(ic, txt, icon("mdi:chevron-right"));
+      row.addEventListener("click", () => {
+        s.key = c.key;
+        s.selected = null;
+        s.techOpen = false;
+        this._renderAddDevice();
+      });
+      box.appendChild(row);
+    }
+  }
+
+  _renderAddDevice() {
+    const s = this._addState;
+    const hass = this._hass;
+    const areaId = this._areaId();
+    const c = this._addCandidates().find((x) => x.key === s.key);
+    if (!c) {
+      s.key = null;
+      this._renderAdd();
+      return;
+    }
+    const placed = this._placedIds();
+    // Vorauswahl: was schon hier ist, so wie es am Tablet steht; aus „Ohne Raum“ das
+    // Sinnvolle; was in einem anderen Raum steht, bleibt dort, bis man es anhakt.
+    if (!s.selected) {
+      s.selected = new Set(
+        c.entities
+          .filter((e) => {
+            const a = this._entityArea(e);
+            if (a === areaId) return this._isShown(e, placed);
+            return !a && ElvioRooms.preselect(e.entity_id, this._deviceClass(e.entity_id), c.kind);
+          })
+          .map((e) => e.entity_id),
+      );
+    }
+    const room = this._config.title;
+    const d = c.device;
+    const devArea = d && d.area_id ? (hass.areas[d.area_id] && hass.areas[d.area_id].name) || d.area_id : null;
+    this._editTitle.textContent = c.name;
+    this._editHint.textContent = !d || d.area_id === areaId
+      ? `Angehakt erscheint in ${room}.`
+      : !d.area_id
+        ? `Angehakt erscheint in ${room}. Das Gerät hat noch keinen Raum und kommt ganz hierher.`
+        : `Angehakt erscheint in ${room}. Das Gerät bleibt in ${devArea}, nur das Angehakte kommt her.`;
+    const list = this._editList;
+    list.innerHTML = "";
+    // Kurze Namen: „Klingel Bewegung“ → „Bewegung“, wenn das Gerät „Klingel“ heißt.
+    const short = (id) => {
+      const full = this._friendly(id);
+      return d && full.startsWith(`${c.name} `) ? full.slice(c.name.length + 1) : full;
+    };
+    const row = (e) => {
+      const st = hass.states[e.entity_id];
+      const r = el("div", "erow");
+      const ic = el("div", "eicon");
+      ic.appendChild(icon(e.icon || st.attributes.icon || this._defaultIcon(st)));
+      const a = this._entityArea(e);
+      const where = a && a !== areaId ? `in ${(hass.areas[a] && hass.areas[a].name) || a}` : null;
+      const txt = el("div", "etext");
+      txt.append(el("div", "sname", short(e.entity_id)), el("div", "ssub", [hass.formatEntityState(st), where].filter(Boolean).join(" · ")));
+      const sw = el("button", "lswitch");
+      const sync = () => {
+        const on = s.selected.has(e.entity_id);
+        sw.classList.toggle("on", on);
+        sw.setAttribute("aria-label", on ? "Nicht hinzufügen" : "Hinzufügen");
+      };
+      sw.addEventListener("click", () => {
+        if (s.selected.has(e.entity_id)) s.selected.delete(e.entity_id);
+        else s.selected.add(e.entity_id);
+        sync();
+      });
+      sync();
+      r.append(ic, txt, sw);
+      return r;
+    };
+    const useful = (e) => s.selected.has(e.entity_id) || ElvioRooms.isUseful(e.entity_id, this._deviceClass(e.entity_id));
+    const sorted = [...c.entities].sort((a, b) => short(a.entity_id).localeCompare(short(b.entity_id), "de"));
+    const main = sorted.filter(useful);
+    const tech = sorted.filter((e) => !useful(e));
+    for (const e of main) list.appendChild(row(e));
+    if (tech.length) {
+      list.appendChild(this._foldButton(`Messwerte & Technik (${tech.length})`, s.techOpen, () => {
+        s.techOpen = !s.techOpen;
+        this._renderAddDevice();
+      }));
+      if (s.techOpen) for (const e of tech) list.appendChild(row(e));
+    }
+    const save = el("button", "pbtn unlock esave", "Hinzufügen");
+    save.addEventListener("click", () => this._saveAdd(save));
+    list.appendChild(save);
+  }
+
+  async _saveAdd(btn) {
+    const s = this._addState;
+    const c = s && this._addCandidates().find((x) => x.key === s.key);
+    if (!c) return;
+    const plan = ElvioRooms.addPlan({
+      device: c.device ? { id: c.device.id, area_id: c.device.area_id || null } : null,
+      entities: c.entities.map((e) => ({ entity_id: e.entity_id, area_id: e.area_id || null, labels: e.labels || [] })),
+      selected: [...s.selected],
+      areaId: this._areaId(),
+      placed: [...this._placedIds()],
+    });
+    btn.disabled = true;
+    btn.textContent = "Speichert …";
+    this._editMsg.hidden = true;
+    try {
+      if (plan.entities.some((x) => x.labels)) await this._ensureLabels();
+      if (plan.device) await this._hass.callWS({ type: "config/device_registry/update", ...plan.device });
+      for (const x of plan.entities) await this._hass.callWS({ type: "config/entity_registry/update", ...x });
+      this._addState = null;
+      this._openEdit();
+    } catch (err) {
+      // Nichts zurückdrehen: Gespeichertes steht in HA richtig, ein zweiter Versuch holt den
+      // Rest nach (der Plan rechnet nur noch die fehlenden Änderungen).
+      this._editMsg.textContent = `Nicht vollständig gespeichert: ${err.message || err}`;
+      this._editMsg.hidden = false;
+      btn.disabled = false;
+      btn.textContent = "Erneut versuchen";
     }
   }
 
@@ -3890,14 +5336,10 @@ class ElvioRoomCard extends HTMLElement {
     this._editMsg.hidden = true;
     try {
       await this._ensureLabels();
-      const labels = new Set(e.labels || []);
-      labels.delete(LABEL_SHOW.id);
-      labels.delete(LABEL_HIDE.id);
       // Nur die Abweichung vom Normalfall wird gespeichert.
       const byDefault = placed.has(e.entity_id) || AUTO_DOMAINS.includes(e.entity_id.split(".")[0]);
-      if (show && !byDefault) labels.add(LABEL_SHOW.id);
-      if (!show && byDefault) labels.add(LABEL_HIDE.id);
-      await this._hass.callWS({ type: "config/entity_registry/update", entity_id: e.entity_id, labels: [...labels] });
+      const labels = ElvioRooms.shownLabels(e.labels, show, byDefault);
+      await this._hass.callWS({ type: "config/entity_registry/update", entity_id: e.entity_id, labels });
     } catch (err) {
       this._editMsg.textContent = `Nicht gespeichert: ${err.message || err}`;
       this._editMsg.hidden = false;
@@ -3906,10 +5348,9 @@ class ElvioRoomCard extends HTMLElement {
 
   // Räume, in die man verschieben kann: die Räume des Tablets, die einen HA-Bereich haben.
   _moveTargets() {
-    return (this._config.nav || [])
-      .filter((r) => r.room)
-      .map((r) => ({ name: r.name, icon: r.icon, areaId: this._resolveArea(r.area || r.name) }))
-      .filter((r) => r.areaId);
+    return this._rooms()
+      .filter((r) => r.areaId)
+      .map((r) => ({ name: r.name, icon: r.icon, areaId: r.areaId }));
   }
 
   _openMove(e) {
@@ -4715,9 +6156,15 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .tv-controls .tv-power.on { background: rgba(255,255,255,.92); color: #1f1f1f; }
 
 .tile.agenda { justify-content: flex-start; padding: 18px 20px 16px; cursor: default; }
-.editbtn { display: grid; place-items: center; padding: 4px; background: none; border: 0; color: inherit;
-  cursor: pointer; opacity: .7; --mdc-icon-size: 18px; filter: drop-shadow(0 1px 6px rgba(0,0,0,.25)); }
-.editbtn:active { transform: scale(.97); }
+.pillbtn { flex: none; display: inline-flex; align-items: center; gap: 8px; height: 44px; padding: 0 18px 0 14px;
+  border-radius: 999px; font-size: 15px; font-weight: 600; white-space: nowrap; color: #fff;
+  background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.26); --mdc-icon-size: 20px;
+  backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+.pillbtn[hidden] { display: none; }
+.pillbtn:active { transform: scale(.97); }
+.pillbtn.on { background: rgba(255,255,255,.92); color: #1f1f1f; border-color: transparent; }
+header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-icon-size: 18px;
+  background: rgba(0,0,0,.28); border-color: rgba(255,255,255,.3); }
 .ehint { font-size: 13px; opacity: .7; margin: -4px 0 14px; }
 .emsg { font-size: 13px; margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; background: rgba(196,45,45,.5); }
 .erow { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,.08); }
@@ -4728,6 +6175,11 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .epick { width: 100%; text-align: left; color: inherit; font: inherit; background: none; border: 0;
   border-bottom: 1px solid rgba(255,255,255,.08); cursor: pointer; }
 .epick.current { opacity: .5; cursor: default; }
+.efold { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; --mdc-icon-size: 18px; }
+.eaddhead { flex: none; margin-bottom: 6px; }
+.eaddhead .sfilters { margin-top: 12px; }
+.eaddlist { display: flex; flex-direction: column; }
+.epick > ha-icon { flex: none; opacity: .5; }
 .esub { margin: 22px 0 4px; font-size: 13px; font-weight: 600; opacity: .75; text-transform: uppercase; letter-spacing: .06em; }
 .tile.energy { justify-content: flex-start; padding: 18px 20px 16px; cursor: default; gap: 10px; }
 .tile.energy.sunny { background: linear-gradient(135deg, rgba(255,196,84,.32), rgba(255,255,255,.14) 60%); }
@@ -4800,7 +6252,7 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .sback { align-self: center; flex: none; margin-top: auto; padding: 34px 32px calc(14px + var(--sab)); font-size: 16px; font-weight: 600;
   letter-spacing: .02em; opacity: .8; }
 .sback:active { opacity: .5; }
-.sactions { display: flex; gap: 22px; }
+.sactions { display: flex; align-items: center; gap: 20px; }
 .cbox { margin: auto 0 0; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 14px;
   --mdc-icon-size: 44px; animation: riseIn .55s cubic-bezier(.2,.75,.25,1) backwards; }
 .ctitle { font-size: 26px; font-weight: 700; letter-spacing: -.01em; max-width: 520px; }
@@ -4858,6 +6310,42 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .roomcard { position: relative; height: 132px; border-radius: 18px; overflow: hidden; text-align: left;
   background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14); }
 .roomcard.current { border-color: rgba(255,255,255,.7); }
+.rgroup { grid-column: 1 / -1; margin: 10px 2px 0; font-size: 13px; font-weight: 600; opacity: .75;
+  text-transform: uppercase; letter-spacing: .06em; }
+.rgroup:first-child { margin-top: 0; }
+.roomgrid.editing .roomcard { cursor: pointer; }
+.roomcard.hiddenroom .rc-img { filter: grayscale(1) brightness(.5); }
+.roomcard.hiddenroom .rc-text { opacity: .6; }
+.rc-move { position: absolute; top: 10px; right: 10px; z-index: 2; display: flex; gap: 6px; }
+.rc-arrow { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+  background: rgba(0,0,0,.45); --mdc-icon-size: 20px; }
+.rc-arrow:disabled { opacity: .25; cursor: default; }
+.roomadd { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  border-style: dashed; font-size: 14px; font-weight: 600; --mdc-icon-size: 26px; }
+.roomadd::after { display: none; }
+.einput { width: 100%; height: 48px; padding: 0 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,.2);
+  background: rgba(255,255,255,.08); color: inherit; font: inherit; font-size: 16px; outline: none; }
+.einput:focus { border-color: rgba(255,255,255,.6); }
+.echips { display: flex; flex-wrap: wrap; gap: 8px; }
+.echip { height: 38px; padding: 0 16px; border-radius: 999px; background: rgba(255,255,255,.1); font-size: 14px; }
+.echip.on { background: rgba(255,255,255,.9); color: #1f1f1f; }
+.esave { flex: none; margin-top: 24px; }
+.stextbtn.edanger { color: #ff6b61; margin-top: 14px; align-self: center; }
+.pbtn.edangerbtn { flex: none; width: 100%; background: #ff453a; color: #fff; }
+.iconpick { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.ipick { height: 64px; border-radius: 16px; display: grid; place-items: center; background: rgba(255,255,255,.08);
+  --mdc-icon-size: 28px; }
+.ipick.on { background: rgba(255,255,255,.9); color: #1f1f1f; }
+.ethumb { width: 100%; height: 100%; object-fit: cover; border-radius: 12px; }
+.imgpick { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.impick { position: relative; height: 96px; border-radius: 14px; overflow: hidden; background: rgba(255,255,255,.08);
+  border: 2px solid transparent; cursor: pointer; }
+.impick img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.impick.on { border-color: rgba(255,255,255,.9); }
+.impick.imtext { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  font-size: 14px; font-weight: 600; --mdc-icon-size: 26px; }
+.impick input { display: none; }
+.impick.busy { opacity: .6; pointer-events: none; }
 .rc-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; filter: brightness(.82) saturate(1.05); }
 .rc-img:not([src]) { display: none; }
 .roomcard::after { content: ""; position: absolute; inset: 0;
