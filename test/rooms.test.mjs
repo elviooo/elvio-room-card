@@ -130,3 +130,50 @@ test("swap: tauscht zwei IDs, Rest bleibt", () => {
   assert.deepEqual(R.swap(["a", "b", "c", "d"], "b", "d"), ["a", "d", "c", "b"]);
   assert.deepEqual(R.swap(["a", "b"], "a", "zz"), ["a", "b"]);
 });
+
+// ── Stockwerke verwalten ──
+
+test("groupForEdit: alle Stockwerke in Registry-Reihenfolge, auch leere, dann „Weitere“", () => {
+  const floors = [
+    { floor_id: "eg", name: "Erdgeschoss" },
+    { floor_id: "og", name: "Obergeschoss" },
+    { floor_id: "keller", name: "Keller" },
+  ];
+  const rooms = [
+    { areaId: "kueche", floorId: "eg" },
+    { areaId: "bad", floorId: "og" },
+    { areaId: "schuppen", floorId: null },
+  ];
+  const groups = R.groupForEdit(rooms, floors);
+  assert.deepEqual(
+    groups.map((g) => [g.floorId, g.title, g.rooms.map((r) => r.areaId)]),
+    [
+      ["eg", "Erdgeschoss", ["kueche"]],
+      ["og", "Obergeschoss", ["bad"]],
+      ["keller", "Keller", []],
+      [null, "Weitere", ["schuppen"]],
+    ],
+  );
+});
+
+test("groupForEdit: ohne Räume ohne Stockwerk keine Gruppe „Weitere“; ohne Stockwerke eine Gruppe ohne Titel", () => {
+  const floors = [{ floor_id: "eg", name: "Erdgeschoss" }];
+  assert.deepEqual(
+    R.groupForEdit([{ areaId: "a", floorId: "eg" }], floors).map((g) => g.floorId),
+    ["eg"],
+  );
+  assert.deepEqual(R.groupForEdit([{ areaId: "a", floorId: null }], []), [
+    { floorId: null, title: null, rooms: [{ areaId: "a", floorId: null }] },
+  ]);
+  assert.deepEqual(R.groupForEdit([], []), [{ floorId: null, title: null, rooms: [] }]);
+});
+
+test("floorPreset: Vorlagen mit Symbol und Ebene, unabhängig von Groß-/Kleinschreibung", () => {
+  assert.deepEqual(R.floorPreset("keller"), { name: "Keller", icon: "mdi:home-floor-negative-1", level: -1 });
+  assert.deepEqual(R.floorPreset("Erdgeschoss"), { name: "Erdgeschoss", icon: "mdi:home-floor-0", level: 0 });
+  assert.equal(R.floorPreset("Obergeschoss").level, 1);
+  assert.equal(R.floorPreset("Dachgeschoss").icon, "mdi:home-roof");
+  assert.equal(R.floorPreset("Aussen").level, null);
+  assert.equal(R.floorPreset("Außen").name, "Aussen");
+  assert.equal(R.floorPreset("Büro"), null);
+});

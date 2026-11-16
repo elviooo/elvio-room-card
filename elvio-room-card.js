@@ -290,6 +290,19 @@ const ROOM_ICONS = [
   "mdi:door", "mdi:stairs", "mdi:home-floor-negative-1", "mdi:garage-variant", "mdi:tools",
   "mdi:flower-outline", "mdi:pine-tree", "mdi:grill-outline", "mdi:pool", "mdi:car-outline",
 ];
+// Stockwerke: Vorlagen (Name, Symbol, Ebene für HA) und Symbole zur Auswahl. Namen ohne
+// Umlaute wie die übrigen Namen in HA.
+const FLOOR_PRESETS = [
+  { name: "Keller", icon: "mdi:home-floor-negative-1", level: -1 },
+  { name: "Erdgeschoss", icon: "mdi:home-floor-0", level: 0 },
+  { name: "Obergeschoss", icon: "mdi:home-floor-1", level: 1 },
+  { name: "Dachgeschoss", icon: "mdi:home-roof", level: 2 },
+  { name: "Aussen", icon: "mdi:tree-outline", level: null },
+];
+const FLOOR_ICONS = [
+  "mdi:home-floor-negative-1", "mdi:home-floor-0", "mdi:home-floor-1", "mdi:home-floor-2", "mdi:home-floor-3",
+  "mdi:home-roof", "mdi:tree-outline", "mdi:garage-variant", "mdi:stairs", "mdi:home-outline",
+];
 // Eigene Fotos: längste Kante beim Hochladen – reicht fürs Tablet, schont Speicher und Netz.
 const ROOM_PHOTO_MAX = 1920;
 
@@ -371,6 +384,29 @@ const ElvioRooms = {
     }
     if (groups.length === 1) groups[0].title = null;
     return groups;
+  },
+
+  // Bearbeiten-Modus: jedes Stockwerk aus HA (auch ohne Räume, damit man es füllen kann), in
+  // Registry-Reihenfolge; Räume ohne Stockwerk unter „Weitere“. Ohne Stockwerke eine Gruppe.
+  groupForEdit(rooms, floors) {
+    const list = floors || [];
+    if (!list.length) return [{ floorId: null, title: null, rooms: [...(rooms || [])] }];
+    const groups = list.map((f) => ({ floorId: f.floor_id, title: f.name, rooms: [] }));
+    const rest = { floorId: null, title: "Weitere", rooms: [] };
+    for (const r of rooms || []) (groups.find((g) => g.floorId === r.floorId) || rest).rooms.push(r);
+    if (rest.rooms.length) groups.push(rest);
+    return groups;
+  },
+
+  // Vorlage zu einem Namen; „Außen“ und „Aussen“ gelten als gleich.
+  floorPreset(name) {
+    const key = ElvioRooms.floorKey(name);
+    const p = FLOOR_PRESETS.find((x) => ElvioRooms.floorKey(x.name) === key);
+    return p ? { ...p } : null;
+  },
+
+  floorKey(name) {
+    return String(name || "").trim().toLowerCase().replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue").replace(/ß/g, "ss");
   },
 
   areaFromLocation(search) {
@@ -1284,6 +1320,8 @@ class ElvioRoomCard extends HTMLElement {
     // selbst nicht geändert hat, z. B. ein ausgeblendeter Sensor zieht um).
     if (this._editWrap && !this._editWrap.hidden) {
       if (regChanged && this._editMode === "devices") this._renderEdit();
+      // Neues Stockwerk aus dem Raum-Blatt: erst jetzt kennt hass.floors es als Auswahl.
+      if (prev && hass.floors !== prev.floors && this._editMode === "room") this._renderRoomForm();
       if (this._editMode === "automations") this._renderAutomations();
     }
   }
@@ -1296,6 +1334,7 @@ class ElvioRoomCard extends HTMLElement {
     const editing = open && this._editMode === "devices";
     const adding = open && this._editMode === "add" && !!this._addState;
     const roomForm = open && this._editMode === "room" && !!this._roomDraft;
+    const floorForm = open && this._editMode === "floor" && !!this._floorDraft;
     const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
     const energyOpen = this._energyWrap && !this._energyWrap.hidden;
     this._build(true);
@@ -1315,6 +1354,12 @@ class ElvioRoomCard extends HTMLElement {
       this._editActions.replaceChildren();
       this._editWrap.hidden = false;
       this._renderRoomForm();
+    }
+    if (floorForm) {
+      this._editMode = "floor";
+      this._editActions.replaceChildren();
+      this._editWrap.hidden = false;
+      this._renderFloorForm();
     }
   }
 
@@ -5320,10 +5365,14 @@ class ElvioRoomCard extends HTMLElement {
       this._roomGrid.classList.toggle("editing", editing);
       const here = this._areaId();
       this._roomCards = [];
-      const groups = ElvioRooms.groupByFloor(this._rooms({ includeHidden: editing }));
-      if (editing && !groups.length) groups.push({ floorId: null, title: null, rooms: [] });
+      const rooms = this._rooms({ includeHidden: editing });
+      const groups = editing
+        ? ElvioRooms.groupForEdit(rooms, Object.values(this._hass.floors || {}))
+        : ElvioRooms.groupByFloor(rooms);
+      const floorIds = groups.filter((g) => g.floorId).map((g) => g.floorId);
       for (const group of groups) {
-        if (group.title) this._roomGrid.appendChild(el("div", "rgroup", group.title));
+        if (editing && group.floorId) this._roomGrid.appendChild(this._floorHeader(group, floorIds));
+        else if (group.title) this._roomGrid.appendChild(el("div", "rgroup", group.title));
         group.rooms.forEach((room, i) => {
           // Im Bearbeiten-Modus ein div: Die Pfeile darin sind eigene Knöpfe.
           const card = el(editing ? "div" : "button", "roomcard");
@@ -5374,6 +5423,12 @@ class ElvioRoomCard extends HTMLElement {
           this._roomGrid.appendChild(add);
         }
       }
+      if (editing) {
+        const addFloor = el("button", "roomcard roomadd flooradd");
+        addFloor.append(icon("mdi:home-plus-outline"), el("span", "", "Stockwerk hinzufügen"));
+        addFloor.addEventListener("click", () => this._openFloorForm(null));
+        this._roomGrid.appendChild(addFloor);
+      }
     }
     // Live-Status je Raum: Lichter an, Temperatur.
     for (const { room, status } of this._roomCards) {
@@ -5394,6 +5449,225 @@ class ElvioRoomCard extends HTMLElement {
       }
       status.textContent = parts.join(" · ");
     }
+  }
+
+  // Überschrift eines Stockwerks im Bearbeiten-Modus: Name, Pfeile (Reihenfolge), Stift.
+  _floorHeader(group, floorIds) {
+    const head = el("div", "rgroup rgroup-edit");
+    head.appendChild(el("span", "rg-title", group.title));
+    const actions = el("div", "rg-actions");
+    const i = floorIds.indexOf(group.floorId);
+    for (const [name, label, other] of [
+      ["mdi:chevron-up", "Stockwerk nach oben", floorIds[i - 1]],
+      ["mdi:chevron-down", "Stockwerk nach unten", floorIds[i + 1]],
+    ]) {
+      const b = el("button", "rc-arrow");
+      b.setAttribute("aria-label", label);
+      b.appendChild(icon(name));
+      b.disabled = !other;
+      b.addEventListener("click", () => other && this._swapFloors(group.floorId, other));
+      actions.appendChild(b);
+    }
+    const edit = el("button", "rc-arrow");
+    edit.setAttribute("aria-label", "Stockwerk bearbeiten");
+    edit.appendChild(icon("mdi:pencil-outline"));
+    edit.addEventListener("click", () => this._openFloorForm(group.floorId));
+    actions.appendChild(edit);
+    head.appendChild(actions);
+    return head;
+  }
+
+  async _swapFloors(a, b) {
+    this._roomsMsg.hidden = true;
+    try {
+      const list = await this._hass.callWS({ type: "config/floor_registry/list" });
+      const ids = list.map((x) => x.floor_id);
+      await this._hass.callWS({ type: "config/floor_registry/reorder", floor_ids: ElvioRooms.swap(ids, a, b) });
+    } catch (err) {
+      this._roomsMsg.textContent = `Nicht verschoben: ${setupErrText(err)}`;
+      this._roomsMsg.hidden = false;
+    }
+  }
+
+  // ───────────── Stockwerk-Blatt ─────────────
+  // Wie das Raum-Blatt; aus dem Raum-Blatt geöffnet („+ Neues Stockwerk“) geht es danach
+  // dorthin zurück, mit dem neuen Stockwerk ausgewählt.
+
+  _openFloorForm(floorId, back = null) {
+    const f = floorId && (this._hass.floors || {})[floorId];
+    this._floorDraft = f
+      ? { floorId, name: f.name, icon: f.icon || null, level: f.level ?? null }
+      : { floorId: null, name: "", icon: null, level: null };
+    this._floorBack = back;
+    this._floorView = "main";
+    this._editMode = "floor";
+    this._editActions.replaceChildren();
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderFloorForm();
+  }
+
+  _floorIcon(f) {
+    if (f.icon) return f.icon;
+    const lv = f.level;
+    if (lv == null) return "mdi:home-outline";
+    return lv < 0 ? "mdi:home-floor-negative-1" : `mdi:home-floor-${Math.min(3, lv)}`;
+  }
+
+  _renderFloorForm() {
+    if (this._editMode !== "floor" || this._editWrap.hidden || !this._floorDraft) return;
+    const f = this._floorDraft;
+    const list = this._editList;
+    list.innerHTML = "";
+    if (this._floorView === "icon") return this._renderFloorIconPick();
+    if (this._floorView === "delete") return this._renderFloorDelete();
+    this._editTitle.textContent = f.floorId ? "Stockwerk bearbeiten" : "Neues Stockwerk";
+    this._editHint.textContent = "Gespeichert wird in Home Assistant – Updates ändern daran nichts.";
+    const name = el("input", "einput");
+    name.value = f.name;
+    name.placeholder = "Name, z. B. Keller";
+    name.addEventListener("input", () => {
+      f.name = name.value;
+      for (const c of chips.children) c.classList.toggle("on", c.dataset.name === ElvioRooms.floorKey(f.name));
+    });
+    // Vorlagen setzen Name, Symbol und Ebene (HA sortiert und zeigt Stockwerke danach).
+    const chips = el("div", "echips");
+    for (const p of FLOOR_PRESETS) {
+      const b = el("button", "echip", p.name);
+      b.dataset.name = ElvioRooms.floorKey(p.name);
+      b.classList.toggle("on", ElvioRooms.floorKey(f.name) === b.dataset.name);
+      b.addEventListener("click", () => {
+        Object.assign(f, ElvioRooms.floorPreset(p.name));
+        this._renderFloorForm();
+      });
+      chips.appendChild(b);
+    }
+    list.append(el("div", "esub", "Name"), name, chips);
+    const row = el("button", "erow epick");
+    const ic = el("div", "eicon");
+    ic.appendChild(icon(this._floorIcon(f)));
+    row.append(ic, el("div", "etext sname", "Symbol"), el("div", "ssub", "Ändern"));
+    row.addEventListener("click", () => {
+      this._floorView = "icon";
+      this._renderFloorForm();
+    });
+    list.append(el("div", "esub", "Aussehen"), row);
+    const save = el("button", "pbtn unlock esave", f.floorId ? "Speichern" : "Stockwerk anlegen");
+    save.addEventListener("click", () => this._saveFloor(save));
+    list.appendChild(save);
+    if (f.floorId) {
+      const del = el("button", "stextbtn edanger", "Stockwerk löschen");
+      del.addEventListener("click", () => {
+        this._floorView = "delete";
+        this._renderFloorForm();
+      });
+      list.appendChild(del);
+    }
+    if (this._floorBack === "room") {
+      const cancel = el("button", "stextbtn", "Abbrechen");
+      cancel.addEventListener("click", () => this._afterFloorForm(null));
+      list.appendChild(cancel);
+    }
+  }
+
+  _renderFloorIconPick() {
+    const f = this._floorDraft;
+    this._editTitle.textContent = "Symbol wählen";
+    this._editHint.textContent = "";
+    const grid = el("div", "iconpick");
+    for (const name of FLOOR_ICONS) {
+      const b = el("button", "ipick");
+      b.classList.toggle("on", this._floorIcon(f) === name);
+      b.setAttribute("aria-label", name.replace("mdi:", ""));
+      b.appendChild(icon(name));
+      b.addEventListener("click", () => {
+        f.icon = name;
+        this._floorView = "main";
+        this._renderFloorForm();
+      });
+      grid.appendChild(b);
+    }
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      this._floorView = "main";
+      this._renderFloorForm();
+    });
+    this._editList.append(grid, back);
+  }
+
+  _renderFloorDelete() {
+    const f = this._floorDraft;
+    const n = Object.values(this._hass.areas || {}).filter((a) => a.floor_id === f.floorId).length;
+    this._editTitle.textContent = "Stockwerk löschen";
+    this._editHint.textContent = "";
+    const box = el("div", "cbox");
+    box.append(
+      icon("mdi:delete-outline"),
+      el("div", "ctitle", `„${f.name}“ löschen?`),
+      el(
+        "div",
+        "ctext",
+        n
+          ? `${n} ${n === 1 ? "Raum steht" : "Räume stehen"} dann unter „Weitere“ und ${n === 1 ? "lässt" : "lassen"} sich im Raum-Blatt einem anderen Stockwerk zuordnen. Die Räume selbst bleiben.`
+          : "Diesem Stockwerk ist kein Raum zugeordnet.",
+      ),
+    );
+    const go = el("button", "pbtn edangerbtn", "Löschen");
+    go.addEventListener("click", () => this._deleteFloor(go));
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      this._floorView = "main";
+      this._renderFloorForm();
+    });
+    box.append(go, back);
+    this._editList.appendChild(box);
+  }
+
+  async _saveFloor(button) {
+    const f = this._floorDraft;
+    const name = f.name.trim();
+    if (!name) return this._roomFormError("Bitte einen Namen eingeben.");
+    this._editMsg.hidden = true;
+    button.disabled = true;
+    const data = { name, icon: f.icon || null, level: f.level ?? null };
+    try {
+      let floorId = f.floorId;
+      if (floorId) await this._hass.callWS({ type: "config/floor_registry/update", floor_id: floorId, ...data });
+      else floorId = (await this._hass.callWS({ type: "config/floor_registry/create", ...data })).floor_id;
+      this._afterFloorForm(floorId);
+    } catch (err) {
+      button.disabled = false;
+      this._roomFormError(`Nicht gespeichert: ${setupErrText(err)}`);
+    }
+  }
+
+  async _deleteFloor(button) {
+    this._editMsg.hidden = true;
+    button.disabled = true;
+    try {
+      await this._hass.callWS({ type: "config/floor_registry/delete", floor_id: this._floorDraft.floorId });
+      if (this._roomDraft && this._roomDraft.floorId === this._floorDraft.floorId) this._roomDraft.floorId = null;
+      this._afterFloorForm(null);
+    } catch (err) {
+      button.disabled = false;
+      this._roomFormError(`Nicht gelöscht: ${setupErrText(err)}`);
+    }
+  }
+
+  // Zurück ins Raum-Blatt (mit dem neuen Stockwerk), sonst Blatt schließen.
+  _afterFloorForm(floorId) {
+    const back = this._floorBack;
+    this._floorDraft = null;
+    this._floorBack = null;
+    if (back === "room" && this._roomDraft) {
+      if (floorId) this._roomDraft.floorId = floorId;
+      this._editMode = "room";
+      this._roomFormView = "main";
+      this._editMsg.hidden = true;
+      this._renderRoomForm();
+      return;
+    }
+    this._editWrap.hidden = true;
   }
 
   // Reihenfolge: HA verlangt beim Umsortieren immer alle Bereiche – frisch holen, zwei tauschen.
@@ -5458,19 +5732,22 @@ class ElvioRoomCard extends HTMLElement {
     list.append(el("div", "esub", "Name"), name);
 
     const floors = Object.values(this._hass.floors || {});
-    if (floors.length) {
-      const chips = el("div", "echips");
-      for (const f of [...floors, { floor_id: null, name: "Kein Stockwerk" }]) {
-        const b = el("button", "echip", f.name);
-        b.classList.toggle("on", (d.floorId || null) === (f.floor_id || null));
-        b.addEventListener("click", () => {
-          d.floorId = f.floor_id || null;
-          this._renderRoomForm();
-        });
-        chips.appendChild(b);
-      }
-      list.append(el("div", "esub", "Stockwerk"), chips);
+    const floorChips = el("div", "echips");
+    for (const f of [...floors, { floor_id: null, name: "Kein Stockwerk" }]) {
+      const b = el("button", "echip", f.name);
+      b.classList.toggle("on", (d.floorId || null) === (f.floor_id || null));
+      b.addEventListener("click", () => {
+        d.floorId = f.floor_id || null;
+        this._renderRoomForm();
+      });
+      floorChips.appendChild(b);
     }
+    // Fehlt das Stockwerk noch (z. B. „Keller“), gleich hier anlegen – danach geht es zurück.
+    const newFloor = el("button", "echip enew");
+    newFloor.append(icon("mdi:plus"), document.createTextNode("Neues Stockwerk"));
+    newFloor.addEventListener("click", () => this._openFloorForm(null, "room"));
+    floorChips.appendChild(newFloor);
+    list.append(el("div", "esub", "Stockwerk"), floorChips);
 
     // Zeile, die eine Auswahl (Icon, Bild) öffnet.
     const pick = (label, view, preview) => {
@@ -7338,6 +7615,14 @@ header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-i
 .roomadd { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
   border-style: dashed; font-size: 14px; font-weight: 600; --mdc-icon-size: 26px; }
 .roomadd::after { display: none; }
+.rgroup.rgroup-edit { display: flex; align-items: center; gap: 10px; margin-top: 18px; opacity: 1; }
+.rgroup.rgroup-edit:first-child { margin-top: 0; }
+.rg-title { flex: 1; min-width: 0; opacity: .75; }
+.rg-actions { display: flex; gap: 6px; }
+.rg-actions .rc-arrow { width: 32px; height: 32px; background: rgba(255,255,255,.12); }
+.roomadd.flooradd { grid-column: 1 / -1; height: 64px; flex-direction: row; margin-top: 10px; }
+.echip.enew { display: inline-flex; align-items: center; gap: 6px; background: none; border: 1px dashed rgba(255,255,255,.4);
+  --mdc-icon-size: 18px; }
 .einput { width: 100%; height: 48px; padding: 0 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,.2);
   background: rgba(255,255,255,.08); color: inherit; font: inherit; font-size: 16px; outline: none; }
 .einput:focus { border-color: rgba(255,255,255,.6); }

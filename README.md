@@ -118,6 +118,11 @@ views:
 - **Räume verwalten** (nur mit Admin-Anmeldung): Raumübersicht → **Bearbeiten**. Raum
   hinzufügen, umbenennen, Stockwerk, Icon, Bild (Galerie oder eigenes Foto), Temperatur,
   „Am Tablet zeigen“, Reihenfolge (Pfeile), löschen. Gespeichert wird in HA.
+- **Stockwerke** (Keller, Erdgeschoss, Außen …) im selben Bearbeiten-Modus: „Stockwerk
+  hinzufügen“ mit Vorlagen (setzen Symbol und Ebene), an jeder Stockwerk-Überschrift Pfeile zum
+  Sortieren und ein Stift zum Umbenennen oder Löschen (die Räume landen dann unter „Weitere“).
+  Leere Stockwerke stehen im Bearbeiten-Modus mit „Raum hinzufügen“ da; im Raum-Blatt legt
+  „+ Neues Stockwerk“ eines an und wählt es gleich aus.
 - **Geräte hinzufügen** (nur mit Admin-Anmeldung): im Raum oben der Stift → **+ Hinzufügen**.
   Sucht im ganzen Haus (Filter: Kameras & Klingeln, Sensoren, Schalter & Steckdosen, Licht,
   Sonstiges); Antippen zeigt die Funktionen des Geräts zum Anhaken. Sinnvolles ist vorausgewählt
