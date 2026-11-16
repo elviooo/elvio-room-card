@@ -97,6 +97,7 @@ views:
         title: Einstellungen
         tiles:
           - {type: setup}
+          - {type: views}
 ```
 
 `DASHBOARD-URL` ist der Pfad des neuen Dashboards (steht nach dem Anlegen in der Adresszeile,
@@ -136,6 +137,7 @@ Pflicht je Karte: `title` und mindestens eine Kachel in `tiles`.
 | `automations` | `templates` |
 | `fuel` | `stations` (Liste mit `name`, `e5`, `e10`, `diesel` – Preis-Sensoren, z. B. Tankerkönig), optional `default` (`e5`/`e10`/`diesel`), `hours` (Verlauf, Standard 48) |
 | `setup` | – |
+| `views` | – (Ansichten „Personen“/„Energie“ ein/aus, Personen ausblenden) |
 
 ## Schritt 4: Einfügen (wenn der Connector keine Dashboards speichern kann)
 
@@ -152,7 +154,7 @@ Dem Nutzer Schritt für Schritt erklären:
 
 ## Schritt 5: Zusatzfunktionen einrichten
 
-Immer eine Ansicht „Einstellungen“ mit den Kacheln `{type: setup}` und
+Immer eine Ansicht „Einstellungen“ mit den Kacheln `{type: setup}`, `{type: views}` und
 `{type: automations, name: Automationen, templates: []}` anlegen (alle Automationen ein/aus,
 für Admins Bearbeiten und Neu). Dort richtet der
 Nutzer mit einem Tipp ein, was außerhalb der Karte installiert werden muss: Music Assistant,

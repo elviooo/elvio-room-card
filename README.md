@@ -68,6 +68,7 @@ die eigene Installation angepasst werden.
 | `automations` | `templates` |
 | `fuel` | `stations` (Liste mit `name`, `e5`, `e10`, `diesel` – Preis-Sensoren, z. B. Tankerkönig), optional `default` (`e5`/`e10`/`diesel`), `hours` (Verlauf, Standard 48) |
 | `setup` | – (nur für Admins bedienbar, siehe „Einrichtung auf Knopfdruck“) |
+| `views` | – (Ansichten „Personen“ und „Energie“ ein/aus, Personen einzeln ausblenden; Ändern nur für Admins) |
 
 Weitere Kacheln lassen sich unter `sections` gruppieren (`title` + `tiles`).
 
@@ -111,7 +112,7 @@ views:
         title: Raum
         area: auto                       # Raum kommt aus der Adresse: …/raum?bereich=<id>
         tiles: [{type: lights, name: Licht, entities: []}]
-  - {title: Einstellungen, path: einstellungen, type: panel, cards: [{<<: *basis, title: Einstellungen, tiles: [{type: setup}]}]}
+  - {title: Einstellungen, path: einstellungen, type: panel, cards: [{<<: *basis, title: Einstellungen, tiles: [{type: setup}, {type: views}]}]}
 ```
 
 - **Leiste:** „Räume“ erscheint hinter dem ersten Eintrag; die Übersicht gruppiert nach Stockwerk.
@@ -148,6 +149,23 @@ views:
   Bild, Reihenfolge und Labels der Bereiche bleiben; das alte Dashboard liest sie nicht.
 - Getestet mit Home Assistant 2026.11 (Stockwerke, Bereichs-Reihenfolge und Temperatursensor
   am Bereich brauchen eine aktuelle Version).
+
+## Personen
+
+Ein Eintrag **„Personen“** in der Leiste (hinter „Räume“) zeigt, wer wo ist – im Design der
+übrigen Ansichten: je Person eine Kachel mit Foto oder Anfangsbuchstabe, Ort („Zuhause“, Name
+der Zone, „Unterwegs“) und seit wann, darunter die Handys der Person mit Akkustand (rot ab 20 %,
+Blitz beim Laden). Unter „Mehr“ eine Karte mit allen, deren Handy eine Position meldet.
+
+Die Daten kommen aus den Personen in Home Assistant und den Handys mit der Home-Assistant-App
+(Standortzugriff „Immer“). Einzelne Personen blendet die Kachel `views` aus (Label „Nicht am
+Tablet“ an der Person).
+
+## Ansichten ein- und ausschalten
+
+Die Kachel `views` („Ansichten“, am besten in den Einstellungen) schaltet „Personen“ und
+„Energie“ für dieses Dashboard ein oder aus. Gespeichert wird in der Dashboard-Konfiguration
+unter `elvio_views` (z. B. `elvio_views: {energy: false}`); ohne Eintrag ist alles an.
 
 ## Energie
 

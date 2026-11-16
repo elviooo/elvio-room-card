@@ -127,6 +127,13 @@ const AUTO_DOMAINS = [
 const LABEL_SHOW = { id: "am_tablet", name: "Am Tablet", icon: "mdi:tablet-dashboard" };
 const LABEL_HIDE = { id: "nicht_am_tablet", name: "Nicht am Tablet", icon: "mdi:eye-off-outline" };
 // Geräte hinzufügen: was sich einem Raum zuordnen lässt und was davon vorausgewählt ist.
+// Kachel-Typen dieser Version. Ohne Entität kommen die einen aus; ein unbekannter Typ (aus einer
+// neueren Version, das Tablet hat aber noch die alte Karte) wird nicht zum Konfigurationsfehler
+// für die ganze Ansicht, sondern zu einer Kachel „Seite neu laden“.
+const TILE_TYPES_NO_ENTITY = [
+  "lights", "service", "account", "now_playing", "search", "agenda", "energy", "tablet_room", "automations", "fuel", "setup", "views",
+];
+const TILE_TYPES = [...TILE_TYPES_NO_ENTITY, "entity", "climate", "camera", "doorbell", "media", "tv", "toggle", "action", "weather"];
 const PICK_DOMAINS = [...AUTO_DOMAINS, "sensor", "binary_sensor", "event", "button", "siren"];
 const USEFUL_CLASSES = {
   sensor: [
@@ -961,6 +968,90 @@ const ElvioEnergy = {
   },
 };
 
+// ───────────── Personen (wer ist wo) ─────────────
+// Reine Aufbereitung für die Ansicht „Personen“; getestet in test/people.test.mjs.
+
+const ElvioPeople = {
+  // Personen aus HA mit Ort, „seit“, Position und Handys. Zuhause zuerst, dann Zonen,
+  // unterwegs, unbekannt. Mit dem Label hideLabel ausgeblendete nur mit includeHidden.
+  list({ states, entities, devices, hideLabel, includeHidden = false }) {
+    const out = [];
+    for (const st of Object.values(states || {})) {
+      if (!st || !String(st.entity_id).startsWith("person.")) continue;
+      const reg = (entities || {})[st.entity_id] || {};
+      const hidden = (reg.labels || []).includes(hideLabel);
+      if (hidden && !includeHidden) continue;
+      const a = st.attributes || {};
+      const name = a.friendly_name || st.entity_id;
+      out.push({
+        id: st.entity_id,
+        name,
+        picture: a.entity_picture || null,
+        initial: String(name).trim().charAt(0).toUpperCase() || "?",
+        place: ElvioPeople.place(st.state),
+        since: Date.parse(st.last_changed) || null,
+        position: Number.isFinite(a.latitude) && Number.isFinite(a.longitude),
+        phones: ElvioPeople.phones(a.device_trackers || [], states, entities || {}, devices || {}),
+        hidden,
+      });
+    }
+    const rank = { home: 0, zone: 1, away: 2, unknown: 3 };
+    return out.sort((x, y) => rank[x.place.kind] - rank[y.place.kind] || x.name.localeCompare(y.name, "de"));
+  },
+
+  place(state) {
+    if (state === "home") return { kind: "home", label: "Zuhause" };
+    if (state === "not_home") return { kind: "away", label: "Unterwegs" };
+    if (!state || state === "unknown" || state === "unavailable") return { kind: "unknown", label: "Standort unbekannt" };
+    return { kind: "zone", label: state };
+  },
+
+  // Handys einer Person: Name des Geräts, Akku (Tracker-Attribut oder Akku-Sensor des
+  // Handys aus der HA-App), lädt gerade, knapp (≤ 20 %).
+  phones(trackers, states, entities, devices) {
+    const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
+    return trackers.map((id) => {
+      const st = states[id];
+      const reg = entities[id] || {};
+      const dev = reg.device_id ? devices[reg.device_id] : null;
+      let battery = st ? num(st.attributes && st.attributes.battery_level) : null;
+      let charging = false;
+      if (dev) {
+        for (const e of Object.values(entities)) {
+          if (e.device_id !== dev.id) continue;
+          const s = states[e.entity_id];
+          if (!s) continue;
+          const dc = (s.attributes || {}).device_class;
+          if (battery == null && e.entity_id.startsWith("sensor.") && dc === "battery") battery = num(s.state);
+          if (/_battery_state$/.test(e.entity_id) && /^charging$/i.test(s.state)) charging = true;
+          if (e.entity_id.startsWith("binary_sensor.") && (dc === "battery_charging" || /_is_charging$/.test(e.entity_id)) && s.state === "on") charging = true;
+        }
+      }
+      const name = dev ? dev.name_by_user || dev.name : (st && st.attributes && st.attributes.friendly_name) || id;
+      return { id, name, battery, charging, low: battery != null && battery <= 20 };
+    });
+  },
+
+  summary(list) {
+    const home = list.filter((p) => p.place.kind === "home").length;
+    const away = list.filter((p) => p.place.kind === "away" || p.place.kind === "zone").length;
+    return [home && `${home} zuhause`, away && `${away} unterwegs`].filter(Boolean).join(" · ");
+  },
+
+  // „seit 14:05“, „seit gestern 09:30“, „seit Mo 16.11.“
+  since(ms, now) {
+    if (!ms) return "";
+    const d = new Date(ms);
+    const n = new Date(now);
+    const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const diff = Math.round((day(n) - day(d)) / 86400000);
+    if (diff <= 0) return `seit ${hm}`;
+    if (diff === 1) return `seit gestern ${hm}`;
+    return `seit ${["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"][d.getDay()]} ${d.getDate()}.${d.getMonth() + 1}.`;
+  },
+};
+
 // ───────────── Gegensprechen über SIP Core ─────────────
 // SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
 // Änderung als Ereignis „sipcore-update“ am window. Benutzt werden nur: callState
@@ -1251,7 +1342,8 @@ class ElvioRoomCard extends HTMLElement {
       if (tile.type === "automations" && !Array.isArray(tile.templates)) {
         throw new Error(`Automationen-Kachel braucht templates: ${JSON.stringify(tile)}`);
       }
-      if (!["lights", "service", "account", "now_playing", "search", "agenda", "energy", "tablet_room", "automations", "fuel", "setup"].includes(tile.type) && !tile.entity) {
+      const type = tile.type || "entity";
+      if (TILE_TYPES.includes(type) && !TILE_TYPES_NO_ENTITY.includes(type) && !tile.entity) {
         throw new Error(`Kachel ohne Entität: ${JSON.stringify(tile)}`);
       }
       if (tile.type === "service" && !tile.path && !tile.config_flow && !tile.url) {
@@ -1287,6 +1379,10 @@ class ElvioRoomCard extends HTMLElement {
     const prev = this._hass;
     this._hass = hass;
     if (this._config && (!this._energyAt || Date.now() - this._energyAt > ENERGY_PREFS_TTL_MS)) this._ensureEnergy();
+    if (this._built && this._navSigBuilt !== undefined && this._navSig() !== this._navSigBuilt) {
+      this._rebuildKeepingPlace();
+      return;
+    }
     // Geräte, Räume oder Labels geändert (Kunde hat etwas gekoppelt oder am Tablet
     // ein-/ausgeblendet): Ansicht neu zusammenstellen. Nur dann – Zustandsänderungen
     // tauschen diese Objekte nicht aus.
@@ -1320,6 +1416,7 @@ class ElvioRoomCard extends HTMLElement {
     // selbst nicht geändert hat, z. B. ein ausgeblendeter Sensor zieht um).
     if (this._editWrap && !this._editWrap.hidden) {
       if (regChanged && this._editMode === "devices") this._renderEdit();
+      if (regChanged && this._editMode === "views") this._renderViews();
       // Neues Stockwerk aus dem Raum-Blatt: erst jetzt kennt hass.floors es als Auswahl.
       if (prev && hass.floors !== prev.floors && this._editMode === "room") this._renderRoomForm();
       if (this._editMode === "automations") this._renderAutomations();
@@ -1337,12 +1434,16 @@ class ElvioRoomCard extends HTMLElement {
     const floorForm = open && this._editMode === "floor" && !!this._floorDraft;
     const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
     const energyOpen = this._energyWrap && !this._energyWrap.hidden;
+    const peopleOpen = this._peopleWrap && !this._peopleWrap.hidden;
+    const viewsOpen = open && this._editMode === "views";
     this._build(true);
     this._update();
     this._scroller.scrollTop = top;
     if (editing) this._openEdit();
     if (adding) this._showAdd();
     if (energyOpen) this._openEnergy(true);
+    if (peopleOpen) this._openPeople(true);
+    if (viewsOpen) this._openViews();
     // Raumübersicht (auch im Bearbeiten-Modus) und Raum-Blatt mit Entwurf bleiben offen.
     if (roomsOpen) {
       this._roomsNavWrap.hidden = false;
@@ -1597,6 +1698,7 @@ class ElvioRoomCard extends HTMLElement {
   disconnectedCallback() {
     // Wer die Ansicht verlässt und zurückkommt, sieht wieder die Ansicht, nicht die Energie-Seite.
     this._closeEnergy();
+    this._closePeople();
     clearInterval(this._energyTimer);
     clearInterval(this._clockTimer);
     clearInterval(this._cameraTimer);
@@ -1726,7 +1828,8 @@ class ElvioRoomCard extends HTMLElement {
     }
     this._wireScroll(frame, scroller, screen);
 
-    const main = [scroller, this._buildEnergy(frame)];
+    const main = [scroller, this._buildEnergy(frame), this._buildPeople(frame)];
+    this._navSigBuilt = this._navSig();
 
     // Leiste unten (nur Handy)
     const tabbar = el("nav", "tabbar");
@@ -1865,6 +1968,14 @@ class ElvioRoomCard extends HTMLElement {
     text.append(name, state);
     node.appendChild(text);
     const tile = { cfg, node, name, state };
+
+    if (!TILE_TYPES.includes(cfg.type || "entity") && !cfg.entity) {
+      tile.unknown = true;
+      node.classList.add("missing");
+      name.textContent = cfg.name || "Neue Kachel";
+      state.textContent = "Seite neu laden – die Karte ist älter als diese Kachel";
+      return tile;
+    }
 
     switch (cfg.type) {
       case "lights": {
@@ -2132,11 +2243,11 @@ class ElvioRoomCard extends HTMLElement {
         // Mit HA-Energie öffnet ein Tipp die Energie-Seite, sonst wie bisher den Solar-Verlauf.
         big.addEventListener("click", (e) => {
           e.stopPropagation();
-          if (this._energyNav) this._openEnergy();
+          if (this._energyOn()) this._openEnergy();
           else this._moreInfo(cfg.solar);
         });
         node.addEventListener("click", () => {
-          if (this._energyNav) this._openEnergy();
+          if (this._energyOn()) this._openEnergy();
         });
         tile.enPrice = el("button", "en-price");
         tile.enPrice.addEventListener("click", (e) => {
@@ -2159,6 +2270,13 @@ class ElvioRoomCard extends HTMLElement {
         node.addEventListener("click", () =>
           this._hass.callService("homeassistant", "toggle", { entity_id: cfg.entity }),
         );
+        break;
+      }
+      case "views": {
+        const ic = el("div", "icon");
+        ic.appendChild(icon(cfg.icon || "mdi:view-dashboard-outline"));
+        node.appendChild(ic);
+        node.addEventListener("click", () => this._openViews());
         break;
       }
       case "setup": {
@@ -2269,6 +2387,7 @@ class ElvioRoomCard extends HTMLElement {
     this._renderLights();
     this._renderRoomsNav();
     this._renderEnergyLive();
+    this._renderPeople();
   }
 
   _updateBackground() {
@@ -2405,6 +2524,7 @@ class ElvioRoomCard extends HTMLElement {
   _updateTile(tile) {
     const hass = this._hass;
     const cfg = tile.cfg;
+    if (tile.unknown) return;
 
     if (cfg.type === "lights") {
       const states = cfg.entities.map((id) => hass.states[id]).filter(Boolean);
@@ -2447,6 +2567,11 @@ class ElvioRoomCard extends HTMLElement {
     }
     if (cfg.type === "fuel") {
       this._updateFuel(tile);
+      return;
+    }
+    if (cfg.type === "views") {
+      tile.name.textContent = cfg.name || "Ansichten";
+      tile.state.textContent = `Energie ${this._viewOn("energy") ? "an" : "aus"} · Personen ${this._viewOn("people") ? "an" : "aus"}`;
       return;
     }
     if (cfg.type === "setup") {
@@ -4730,7 +4855,7 @@ class ElvioRoomCard extends HTMLElement {
       if (all.length && this._rooms().length) {
         items.splice(Math.min(1, items.length), 0, { name: "Räume", icon: "mdi:floor-plan", rooms: true, active: this._isCurrent(base) });
       }
-      return this._withEnergy(items);
+      return this._withPages(items);
     }
     const rooms = all.filter((i) => i.room);
     const items = [];
@@ -4751,35 +4876,307 @@ class ElvioRoomCard extends HTMLElement {
       }
       items.push({ ...item, active: this._isCurrent(item.path) });
     }
-    return this._withEnergy(items);
+    return this._withPages(items);
   }
 
-  // „Energie“ hinter „Räume“ (sonst hinter dem ersten Eintrag) – nur, wenn in HA-Energie
-  // etwas eingetragen ist, und nur in Karten mit Leiste.
-  _withEnergy(items) {
-    if (!this._energyNav || !items.length) return items;
+  // Eigene Seiten hinter „Räume“ (sonst hinter dem ersten Eintrag): „Personen“ und „Energie“ –
+  // je nur mit Daten, eingeschaltet (Kachel „Ansichten“) und nur in Karten mit Leiste.
+  _withPages(items) {
+    if (!items.length) return items;
+    const pages = [];
+    if (this._viewOn("people") && this._people().length) pages.push({ name: "Personen", icon: "mdi:account-group-outline", people: true, active: false });
+    if (this._energyOn()) pages.push({ name: "Energie", icon: "mdi:lightning-bolt-outline", energy: true, active: false });
     const i = items.findIndex((x) => x.rooms);
-    items.splice(i >= 0 ? i + 1 : Math.min(1, items.length), 0, { name: "Energie", icon: "mdi:lightning-bolt-outline", energy: true, active: false });
+    items.splice(i >= 0 ? i + 1 : Math.min(1, items.length), 0, ...pages);
     return items;
   }
 
   _navClick(item) {
-    if (item.energy) {
-      this._openEnergy();
-      return;
-    }
-    // Jeder andere Eintrag verlässt die Energie-Seite – auch der der eigenen Ansicht.
+    if (item.energy) return this._openEnergy();
+    if (item.people) return this._openPeople();
+    // Jeder andere Eintrag verlässt die eigenen Seiten – auch der der eigenen Ansicht.
     this._closeEnergy();
+    this._closePeople();
     if (item.rooms) this._openRoomsNav();
     else this._navigate(item.path);
   }
 
   _markNav() {
-    const on = !!(this._energyWrap && !this._energyWrap.hidden);
-    for (const { item, node } of this._navEls || []) node.classList.toggle("active", on ? !!item.energy : !!item.active);
+    const page = this._energyWrap && !this._energyWrap.hidden ? "energy" : this._peopleWrap && !this._peopleWrap.hidden ? "people" : null;
+    for (const { item, node } of this._navEls || []) node.classList.toggle("active", page ? !!item[page] : !!item.active);
   }
 
+  // Ansichten ein/aus (Kachel „Ansichten“) stehen in der Dashboard-Konfiguration unter
+  // elvio_views, z. B. { energy: false }. Ohne Eintrag ist alles an. Solange die Karte nicht
+  // eingehängt ist, kennt sie das Dashboard nicht – dann gilt der letzte bekannte Stand.
+  _viewPrefs() {
+    const d = this._dashboardConfig();
+    return d ? d.elvio_views || {} : null;
+  }
 
+  _viewOn(key) {
+    const p = this._viewPrefs() || this._viewPrefsLast || {};
+    return p[key] !== false;
+  }
+
+  _energyOn() {
+    return !!this._energyNav && this._viewOn("energy");
+  }
+
+  _people(includeHidden = false) {
+    const h = this._hass;
+    return ElvioPeople.list({ states: h.states, entities: h.entities || {}, devices: h.devices || {}, hideLabel: LABEL_HIDE.id, includeHidden });
+  }
+
+  // Was die Leiste bestimmt; ändert es sich (Ansicht aus, letzte Person ausgeblendet …),
+  // baut die Karte neu auf.
+  _navSig() {
+    const vp = this._viewPrefs();
+    if (vp) this._viewPrefsLast = vp;
+    return JSON.stringify([this._viewPrefsLast || {}, this._people().length > 0, this._energyOn()]);
+  }
+
+  // ───────────── Personen-Seite ─────────────
+  // Wer ist wo: je Person Ort und „seit“, Handys mit Akku; darunter die Karte von HA mit
+  // allen, deren Handy eine Position meldet. Aufbau wie die Energie-Seite.
+
+  _buildPeople(frame) {
+    const scroller = el("div", "scroller pscroller");
+    scroller.hidden = true;
+    const screen = el("section", "screen");
+    const hero = el("section", "hero");
+    this._peopleStatus = el("div", "status");
+    hero.append(this._peopleStatus, el("h1", "", "Personen"));
+    this._peopleFirst = el("div", "tiles");
+    const more = el("button", "more");
+    more.append(icon("mdi:chevron-down"), document.createTextNode("Mehr"));
+    more.addEventListener("click", () => scroller.scrollTo({ top: screen.offsetHeight, behavior: "smooth" }));
+    this._peopleMore = more;
+    screen.append(hero, this._peopleFirst, more);
+    this._peopleSections = el("div", "sections");
+    scroller.append(screen, this._peopleSections);
+    this._wireScroll(frame, scroller, screen);
+    this._peopleWrap = scroller;
+    this._peopleMapEl = null;
+    this._peopleMapKey = null;
+    return scroller;
+  }
+
+  _openPeople(keep = false) {
+    if (!this._peopleWrap) return;
+    const wasOpen = !this._peopleWrap.hidden;
+    if (this._energyWrap && !this._energyWrap.hidden) {
+      this._energyWrap.hidden = true;
+      clearInterval(this._energyTimer);
+    }
+    this._peopleWrap.hidden = false;
+    this._scroller.hidden = true;
+    if (this._roomsNavWrap) this._roomsNavWrap.hidden = true;
+    if (!wasOpen && !keep) {
+      this._peopleWrap.scrollTop = 0;
+      this._frame.style.setProperty("--p", "0");
+      this._frame.classList.remove("scrolled");
+    }
+    this._markNav();
+    this._peopleSig = null;
+    this._renderPeople();
+  }
+
+  _closePeople() {
+    if (!this._peopleWrap || this._peopleWrap.hidden) return;
+    this._peopleWrap.hidden = true;
+    this._scroller.hidden = false;
+    this._markNav();
+    this._scroller.dispatchEvent(new Event("scroll"));
+  }
+
+  _renderPeople() {
+    if (!this._peopleWrap || this._peopleWrap.hidden) return;
+    if (this._peopleMapEl) this._peopleMapEl.hass = this._hass;
+    const list = this._people();
+    // „seit 14:05“ hängt an der Uhr: höchstens einmal je Minute neu zeichnen.
+    const sig = JSON.stringify(list) + Math.floor(Date.now() / 60000);
+    if (sig === this._peopleSig) return;
+    this._peopleSig = sig;
+    const n = list.length;
+    this._peopleStatus.textContent = ElvioPeople.summary(list) || `${n} ${n === 1 ? "Person" : "Personen"}`;
+    const first = this._peopleFirst;
+    first.innerHTML = "";
+    first.style.setProperty("--cols", String(Math.max(1, Math.min(4, n))));
+    list.forEach((p, i) => {
+      const t = this._personTile(p);
+      t.style.setProperty("--i", String(i));
+      first.appendChild(t);
+    });
+    if (!n) first.appendChild(this._energyNote("Keine Personen am Tablet. Personen legt man in HA unter Einstellungen → Personen an."));
+    const withPos = list.filter((p) => p.position).map((p) => p.id);
+    const key = `${n}|${withPos.join(",")}`;
+    if (key !== this._peopleMapKey) {
+      this._peopleMapKey = key;
+      const secs = this._peopleSections;
+      secs.innerHTML = "";
+      this._peopleMapEl = null;
+      if (n) {
+        const b = el("section", "section in shown");
+        b.appendChild(el("h2", "", "Karte"));
+        const tile = el("div", "tile ewide pmap");
+        if (withPos.length) this._mountPeopleMap(tile, withPos);
+        else tile.appendChild(el("div", "state", "Noch keine Positionen. In der Home-Assistant-App am Handy den Standortzugriff auf „Immer“ stellen – dann erscheinen die Personen hier."));
+        b.appendChild(tile);
+        secs.appendChild(b);
+      }
+      this._peopleMore.hidden = !secs.children.length;
+    }
+  }
+
+  // Die Karte von HA selbst (hui-map-card) – dunkel, ohne Verlauf.
+  async _mountPeopleMap(box, ids) {
+    try {
+      const helpers = window.loadCardHelpers ? await window.loadCardHelpers() : null;
+      if (!helpers) throw new Error("Kartenbausteine von HA fehlen");
+      // Das Zuhause als Bezugspunkt dazu; flach genug, dass die Personen-Kacheln sichtbar bleiben.
+      const entities = this._hass.states["zone.home"] ? [...ids, "zone.home"] : ids;
+      const card = await helpers.createCardElement({ type: "map", entities, theme_mode: "dark", hours_to_show: 0, aspect_ratio: "2" });
+      card.hass = this._hass;
+      if (!box.isConnected) return;
+      this._peopleMapEl = card;
+      box.replaceChildren(card);
+    } catch (err) {
+      box.replaceChildren(el("div", "state", `Karte nicht verfügbar: ${(err && err.message) || err}`));
+    }
+  }
+
+  _personTile(p) {
+    const node = el("div", `tile person ${p.place.kind}`);
+    const top = el("div", "ptop");
+    const av = el("div", "pav");
+    if (p.picture) {
+      const img = el("img");
+      img.alt = "";
+      img.src = p.picture;
+      av.appendChild(img);
+    } else {
+      av.textContent = p.initial;
+    }
+    const who = el("div", "pwho");
+    const when = p.place.kind === "unknown" ? "Standort in der HA-App auf „Immer“ stellen" : ElvioPeople.since(p.since, Date.now());
+    who.append(el("div", "name", p.name), el("div", "state", when));
+    top.append(av, who);
+    node.append(top, el("div", "pplace", p.place.label));
+    if (p.phones.length) {
+      const phones = el("div", "pphones");
+      for (const ph of p.phones) {
+        const chip = el("span", "pphone");
+        chip.classList.toggle("low", ph.low);
+        const b = ph.battery;
+        const ic = ph.charging ? "mdi:battery-charging" : b == null ? "mdi:cellphone" : b >= 95 ? "mdi:battery" : `mdi:battery-${Math.max(10, Math.round(b / 10) * 10)}`;
+        const label = b == null ? ph.name : p.phones.length > 1 ? `${ph.name} ${b} %` : `${b} %`;
+        chip.append(icon(ic), document.createTextNode(label));
+        chip.title = ph.name;
+        phones.appendChild(chip);
+      }
+      node.appendChild(phones);
+    }
+    node.addEventListener("click", () => this._moreInfo(p.id));
+    return node;
+  }
+
+  // ───────────── Kachel „Ansichten“: Energie und Personen ein/aus ─────────────
+
+  _openViews() {
+    this._editMode = "views";
+    this._editActions.replaceChildren();
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderViews();
+  }
+
+  _renderViews() {
+    if (this._editMode !== "views" || this._editWrap.hidden) return;
+    const admin = this._isAdmin();
+    this._editTitle.textContent = "Ansichten";
+    this._editHint.textContent = admin
+      ? "Was in der Leiste steht. Gilt für dieses Dashboard auf allen Tablets."
+      : "Ändern geht nur mit Admin-Anmeldung.";
+    const list = this._editList;
+    list.innerHTML = "";
+    const row = (pic, name, sub, on, toggle) => {
+      const r = el("div", "erow");
+      const ic = el("div", "eicon");
+      if (pic && pic.startsWith("mdi:")) ic.appendChild(icon(pic));
+      else if (pic) {
+        const img = el("img", "ethumb");
+        img.alt = "";
+        img.src = pic;
+        ic.appendChild(img);
+      } else ic.textContent = name.trim().charAt(0).toUpperCase();
+      const t = el("div", "etext");
+      t.append(el("div", "sname", name), el("div", "ssub", sub));
+      const sw = el("button", "lswitch");
+      sw.classList.toggle("on", on);
+      sw.disabled = !admin;
+      sw.setAttribute("aria-label", on ? `${name} ausblenden` : `${name} zeigen`);
+      sw.addEventListener("click", () => toggle(!on, sw));
+      r.append(ic, t, sw);
+      return r;
+    };
+    list.appendChild(el("div", "esub", "In der Leiste"));
+    const energy = !!(this._energyN && ElvioEnergy.hasData(this._energyN));
+    list.appendChild(
+      row("mdi:lightning-bolt-outline", "Energie", energy ? "Bezug, Einspeisung, Verbraucher" : "Erscheint, sobald in HA-Energie etwas eingetragen ist",
+        this._viewOn("energy"), (on, sw) => this._setView("energy", on, sw)),
+    );
+    list.appendChild(
+      row("mdi:account-group-outline", "Personen", "Wer ist wo, Handy-Akku, Karte", this._viewOn("people"), (on, sw) => this._setView("people", on, sw)),
+    );
+    const people = this._people(true);
+    if (people.length) {
+      list.appendChild(el("div", "esub", "Personen am Tablet"));
+      for (const p of people) list.appendChild(row(p.picture, p.name, p.place.label, !p.hidden, (on, sw) => this._setPersonShown(p.id, on, sw)));
+    }
+  }
+
+  // Schreibt elvio_views in die Konfiguration dieses Dashboards (nur Admins; YAML-Dashboards
+  // lassen sich so nicht ändern – dann steht der Grund da).
+  async _setView(key, on, sw) {
+    this._editMsg.hidden = true;
+    sw.disabled = true;
+    const dash = this._dashPath();
+    const urlPath = dash === "lovelace" ? null : dash;
+    try {
+      const cfg = await this._hass.callWS({ type: "lovelace/config", url_path: urlPath });
+      const views = { ...(cfg.elvio_views || {}) };
+      if (on) delete views[key];
+      else views[key] = false;
+      if (Object.keys(views).length) cfg.elvio_views = views;
+      else delete cfg.elvio_views;
+      await this._hass.callWS({ type: "lovelace/config/save", url_path: urlPath, config: cfg });
+      this._viewPrefsLast = views;
+      sw.classList.toggle("on", on);
+    } catch (err) {
+      this._editMsg.textContent = `Nicht gespeichert: ${setupErrText(err)}`;
+      this._editMsg.hidden = false;
+    } finally {
+      sw.disabled = false;
+    }
+  }
+
+  async _setPersonShown(id, on, sw) {
+    this._editMsg.hidden = true;
+    sw.disabled = true;
+    try {
+      await this._ensureLabels();
+      const e = (this._hass.entities || {})[id] || {};
+      const labels = (e.labels || []).filter((l) => l !== LABEL_HIDE.id);
+      if (!on) labels.push(LABEL_HIDE.id);
+      await this._hass.callWS({ type: "config/entity_registry/update", entity_id: id, labels });
+    } catch (err) {
+      this._editMsg.textContent = `Nicht gespeichert: ${setupErrText(err)}`;
+      this._editMsg.hidden = false;
+    } finally {
+      sw.disabled = false;
+    }
+  }
 
   // ───────────── Energie-Seite ─────────────
   // Liest, was in HA-Energie eingetragen ist; jeder Teil erscheint nur mit Daten. Nur Anzeige.
@@ -4848,6 +5245,7 @@ class ElvioRoomCard extends HTMLElement {
   _openEnergy(keep = false) {
     if (!this._energyWrap) return;
     const wasOpen = !this._energyWrap.hidden;
+    if (this._peopleWrap) this._peopleWrap.hidden = true;
     this._energyWrap.hidden = false;
     this._scroller.hidden = true;
     if (this._roomsNavWrap) this._roomsNavWrap.hidden = true;
@@ -7384,6 +7782,23 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-icon-size: 18px;
   background: rgba(0,0,0,.28); border-color: rgba(255,255,255,.3); }
 .scroller[hidden] { display: none; }
+.tile.person { justify-content: flex-start; gap: 10px; padding: 20px 20px 18px; min-height: 160px; }
+.ptop { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.pav { width: 46px; height: 46px; flex: none; border-radius: 50%; overflow: hidden; display: grid; place-items: center;
+  background: rgba(255,255,255,.2); font-size: 18px; font-weight: 650; }
+.pav img { width: 100%; height: 100%; object-fit: cover; }
+.tile.person.home .pav { box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
+.pwho { min-width: 0; }
+.pplace { margin-top: auto; font-size: 24px; font-weight: 650; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile.person.unknown .pplace { font-size: 18px; opacity: .65; }
+.pphones { display: flex; flex-wrap: wrap; gap: 6px; }
+.pphone { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 10px; border-radius: 999px;
+  background: rgba(255,255,255,.14); font-size: 12px; font-weight: 600; --mdc-icon-size: 15px; white-space: nowrap; }
+.pphone.low { background: rgba(196,45,45,.75); }
+.tile.pmap { padding: 0; min-height: 340px; cursor: default; justify-content: stretch; }
+.tile.pmap:active { transform: none; }
+.tile.pmap > .state { padding: 22px 24px; font-size: 14px; opacity: .85; }
+.tile.pmap > :not(.state) { flex: 1; display: block; min-height: 340px; }
 .chip.eper { padding: 0 16px; font-size: 13px; font-weight: 600; }
 .chip.eper.active { background: rgba(255,255,255,.9); color: #1f1f1f; border-color: transparent; }
 .screen > .emsg { margin-top: 18px; }
