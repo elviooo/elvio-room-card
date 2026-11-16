@@ -1052,6 +1052,138 @@ const ElvioPeople = {
   },
 };
 
+// ───────────── Szenen ─────────────
+// Szenen am Tablet: echte HA-Szenen (Szenen-Datei wie der Szenen-Editor von HA), am Bereich
+// des Raums oder ohne Bereich fürs ganze Haus. Reine Teile hier, getestet in test/scenes.test.mjs.
+
+const SCENE_PRESETS = [
+  { name: "Abend", icon: "mdi:weather-sunset" },
+  { name: "Essen", icon: "mdi:silverware-fork-knife" },
+  { name: "Kino", icon: "mdi:movie-open-outline" },
+  { name: "Hell", icon: "mdi:white-balance-sunny" },
+  { name: "Gedimmt", icon: "mdi:lightbulb-on-30" },
+  { name: "Lesen", icon: "mdi:book-open-variant" },
+  { name: "Nacht", icon: "mdi:weather-night" },
+  { name: "Alles aus", icon: "mdi:power" },
+];
+const SCENE_ICONS = [
+  "mdi:palette-outline", "mdi:weather-sunset", "mdi:weather-night", "mdi:silverware-fork-knife", "mdi:movie-open-outline",
+  "mdi:white-balance-sunny", "mdi:lightbulb-on-30", "mdi:book-open-variant", "mdi:sofa-outline", "mdi:party-popper",
+  "mdi:coffee-outline", "mdi:power", "mdi:bed-outline", "mdi:music-note", "mdi:heart-outline", "mdi:home-outline",
+];
+// Farben zur Auswahl im Szenen-Blatt (hs: Farbton, Sättigung).
+const SCENE_COLORS = [
+  ["Rot", [0, 85]], ["Orange", [30, 90]], ["Gelb", [52, 85]], ["Grün", [120, 70]],
+  ["Türkis", [180, 70]], ["Blau", [225, 80]], ["Lila", [275, 70]], ["Pink", [320, 70]],
+];
+// Farbe eines Lichts: nur die Angabe seines Farbmodus, sonst stritten sich Farbe und Weißton.
+const SCENE_COLOR_KEYS = {
+  color_temp: "color_temp_kelvin", hs: "hs_color", rgb: "rgb_color", rgbw: "rgbw_color", rgbww: "rgbww_color", xy: "xy_color",
+};
+
+const ElvioScenes = {
+  presets() {
+    return SCENE_PRESETS.map((p) => ({ ...p }));
+  },
+
+  // Stand jetzt als Szene: Lichter mit Helligkeit und Farbe, Rollläden mit Position,
+  // Lüfter mit Stufe, alles andere an/aus.
+  capture(ids, states) {
+    const out = {};
+    for (const id of ids || []) {
+      const st = states[id];
+      if (!st) continue;
+      const a = st.attributes || {};
+      const domain = String(id).split(".")[0];
+      if (domain === "light") {
+        if (st.state !== "on") {
+          out[id] = { state: "off" };
+          continue;
+        }
+        const e = { state: "on" };
+        if (a.brightness != null) e.brightness = a.brightness;
+        if (a.color_mode) e.color_mode = a.color_mode;
+        const key = SCENE_COLOR_KEYS[a.color_mode];
+        if (key && a[key] != null) e[key] = a[key];
+        out[id] = e;
+      } else if (domain === "cover") {
+        const e = { state: st.state };
+        if (a.current_position != null) e.current_position = a.current_position;
+        out[id] = e;
+      } else if (domain === "fan") {
+        const e = { state: st.state };
+        if (st.state === "on" && a.percentage != null) e.percentage = a.percentage;
+        out[id] = e;
+      } else {
+        out[id] = { state: st.state };
+      }
+    }
+    return out;
+  },
+
+  describe(st) {
+    if (!st) return "Nicht gefunden";
+    if (st.state === "unavailable" || st.state === "unknown") return "Nicht erreichbar";
+    const a = st.attributes || {};
+    const domain = String(st.entity_id).split(".")[0];
+    if (domain === "cover") {
+      return st.state === "closed" ? "Zu" : a.current_position != null ? `Offen · ${a.current_position} %` : "Offen";
+    }
+    if (st.state === "on") return a.brightness != null ? `An · ${Math.round((a.brightness / 255) * 100)} %` : "An";
+    return st.state === "off" ? "Aus" : st.state;
+  },
+
+  // Was ein Licht kann (aus supported_color_modes): dimmen, Weißton (mit Grenzen in Kelvin), Farbe.
+  lightCaps(st) {
+    const a = (st && st.attributes) || {};
+    const modes = a.supported_color_modes || [];
+    const color = modes.some((m) => ["hs", "rgb", "rgbw", "rgbww", "xy"].includes(m));
+    const temp = modes.includes("color_temp")
+      ? { min: a.min_color_temp_kelvin || 2000, max: a.max_color_temp_kelvin || 6500 }
+      : null;
+    return { dim: modes.some((m) => m !== "onoff"), temp, color };
+  },
+
+  // Eine Einstellung eines Lichts in der Szene ändern. Aus heißt nur aus; Helligkeit, Weißton
+  // oder Farbe schalten an. Weißton und Farbe schließen sich aus (wie der Farbmodus der Lampe).
+  edit(entry, change) {
+    const e = { ...(entry || {}) };
+    if (change.state === "off") return { state: "off" };
+    e.state = "on";
+    if (change.brightness != null) e.brightness = change.brightness;
+    if (e.brightness == null) e.brightness = 255;
+    const color = (mode, key, value) => {
+      for (const k of Object.values(SCENE_COLOR_KEYS)) delete e[k];
+      e.color_mode = mode;
+      e[key] = value;
+    };
+    if (change.color_temp_kelvin != null) color("color_temp", "color_temp_kelvin", change.color_temp_kelvin);
+    if (change.hs_color != null) color("hs", "hs_color", change.hs_color);
+    return e;
+  },
+
+  pct(brightness) {
+    return brightness == null ? 100 : Math.round((brightness / 255) * 100);
+  },
+
+  bri(pct) {
+    return Math.max(1, Math.min(255, Math.round((pct / 100) * 255)));
+  },
+
+  // Szenen eines Bereichs (areaId null: ohne Bereich), in der Reihenfolge des Anlegens
+  // (die ID aus dem Szenen-Editor ist ein Zeitstempel), Szenen ohne ID danach nach Namen.
+  forArea(scenes, areaOf, areaId) {
+    const key = (s) => {
+      const id = Number((s.attributes || {}).id);
+      return Number.isFinite(id) ? id : Number.MAX_SAFE_INTEGER;
+    };
+    const name = (s) => (s.attributes || {}).friendly_name || s.entity_id;
+    return (scenes || [])
+      .filter((s) => (areaOf(s.entity_id) || null) === (areaId || null))
+      .sort((x, y) => key(x) - key(y) || name(x).localeCompare(name(y), "de"));
+  },
+};
+
 // ───────────── Gegensprechen über SIP Core ─────────────
 // SIP Core (HACS-Integration, TECH7Fox) stellt window.sipCore bereit und meldet jede
 // Änderung als Ereignis „sipcore-update“ am window. Benutzt werden nur: callState
@@ -1432,6 +1564,7 @@ class ElvioRoomCard extends HTMLElement {
     const adding = open && this._editMode === "add" && !!this._addState;
     const roomForm = open && this._editMode === "room" && !!this._roomDraft;
     const floorForm = open && this._editMode === "floor" && !!this._floorDraft;
+    const sceneForm = open && this._editMode === "scene" && !!this._sceneDraft;
     const roomsOpen = this._roomsNavWrap && !this._roomsNavWrap.hidden;
     const energyOpen = this._energyWrap && !this._energyWrap.hidden;
     const peopleOpen = this._peopleWrap && !this._peopleWrap.hidden;
@@ -1461,6 +1594,12 @@ class ElvioRoomCard extends HTMLElement {
       this._editActions.replaceChildren();
       this._editWrap.hidden = false;
       this._renderFloorForm();
+    }
+    if (sceneForm) {
+      this._editMode = "scene";
+      this._editActions.replaceChildren();
+      this._editWrap.hidden = false;
+      this._renderSceneForm();
     }
   }
 
@@ -1789,6 +1928,11 @@ class ElvioRoomCard extends HTMLElement {
     this._status = el("div", "status");
     this._chips = el("div", "chips");
     hero.append(this._status, el("h1", "", c.title), this._chips);
+    // Szenen des Raums (bzw. des Hauses auf Zuhause) als Knöpfe unter dem Titel.
+    this._sceneChips = el("div", "chips scenechips");
+    this._sceneChips.hidden = true;
+    this._sceneKey = "";
+    hero.appendChild(this._sceneChips);
     // Mit Live-Karte: die anderen Räume mit Lautsprecher als Chips über den Kacheln,
     // nebeneinander, bei vielen waagerecht scrollbar. Tipp holt den Raum in die Karte.
     this._roomChips = null;
@@ -2380,6 +2524,7 @@ class ElvioRoomCard extends HTMLElement {
       : "";
 
     this._renderChips();
+    this._renderScenes();
     for (const tile of this._tiles) this._updateTile(tile);
     if (this._popupCard) this._popupCard.hass = hass;
     this._renderRooms();
@@ -4934,6 +5079,434 @@ class ElvioRoomCard extends HTMLElement {
     const vp = this._viewPrefs();
     if (vp) this._viewPrefsLast = vp;
     return JSON.stringify([this._viewPrefsLast || {}, this._people().length > 0, this._energyOn()]);
+  }
+
+  // ───────────── Szenen ─────────────
+  // Im Raum die Szenen seines Bereichs, auf Zuhause die ohne Bereich. Antippen aktiviert,
+  // langes Drücken (Admin) öffnet das Szenen-Blatt, „+ Szene“ legt eine an.
+
+  // Zuhause erkennt die Karte am ersten Leisten-Eintrag (gleicher Name wie der Titel);
+  // scenes: true/false in der Karte überstimmt das.
+  _isHomeCard() {
+    const c = this._config;
+    if (c.scenes === true) return true;
+    if (c.scenes === false || this._areaId()) return false;
+    const first = (c.nav || [])[0];
+    return !!(first && first.name && first.name === c.title);
+  }
+
+  _scenesHere() {
+    if (this._config.scenes === false) return null;
+    const areaId = this._areaId() || null;
+    if (!areaId && !this._isHomeCard()) return null;
+    const hass = this._hass;
+    const reg = hass.entities || {};
+    const all = Object.values(hass.states).filter((st) => st.entity_id.startsWith("scene."));
+    return { areaId, scenes: ElvioScenes.forArea(all, (id) => this._entityArea(reg[id]), areaId) };
+  }
+
+  _renderScenes() {
+    const box = this._sceneChips;
+    if (!box) return;
+    const here = this._scenesHere();
+    const admin = this._isAdmin();
+    const list = here ? here.scenes : [];
+    const key = JSON.stringify([!!here, here && here.areaId, admin, list.map((x) => [x.entity_id, x.attributes.friendly_name, x.attributes.icon])]);
+    if (key === this._sceneKey) return;
+    this._sceneKey = key;
+    box.innerHTML = "";
+    box.hidden = !here || (!list.length && !admin);
+    if (box.hidden) return;
+    for (const sc of list) box.appendChild(this._sceneChip(sc, admin));
+    if (admin) {
+      const add = el("button", "chip scene sceneadd");
+      const av = el("div", "av");
+      av.appendChild(icon("mdi:plus"));
+      const txt = el("div", "txt");
+      txt.appendChild(el("b", "", "Szene"));
+      add.append(av, txt);
+      add.addEventListener("click", () => this._openSceneForm(null, here.areaId));
+      box.appendChild(add);
+    }
+  }
+
+  _sceneChip(sc, admin) {
+    const b = el("button", "chip scene");
+    const av = el("div", "av");
+    av.appendChild(icon(sc.attributes.icon || "mdi:palette-outline"));
+    const txt = el("div", "txt");
+    txt.appendChild(el("b", "", sc.attributes.friendly_name || sc.entity_id));
+    b.append(av, txt);
+    // Langes Drücken öffnet das Blatt; ein Wisch durch die Reihe bricht es ab (pointercancel).
+    let timer = 0;
+    let long = false;
+    const openForm = () => {
+      if (long) return;
+      long = true;
+      clearTimeout(timer);
+      this._openSceneForm(sc.entity_id);
+    };
+    b.addEventListener("pointerdown", () => {
+      long = false;
+      if (admin) timer = setTimeout(openForm, 550);
+    });
+    for (const ev of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(ev, () => clearTimeout(timer));
+    b.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      if (admin) openForm();
+    });
+    b.addEventListener("click", () => {
+      if (long) {
+        long = false;
+        return;
+      }
+      this._hass.callService("scene", "turn_on", { entity_id: sc.entity_id });
+      b.classList.add("fired");
+      setTimeout(() => b.classList.remove("fired"), 900);
+    });
+    return b;
+  }
+
+  // Das Blatt arbeitet auf Werten je Gerät (values): bei einer neuen Szene der Stand jetzt,
+  // bei einer bestehenden das, was in ihr gespeichert ist. Gespeichert werden diese Werte –
+  // die echten Lichter muss man dafür nicht hindrehen.
+  _openSceneForm(entityId, areaId = null) {
+    const hass = this._hass;
+    const st = entityId ? hass.states[entityId] : null;
+    const reg = hass.entities || {};
+    this._sceneDraft = st
+      ? {
+          entityId,
+          configId: st.attributes.id != null ? String(st.attributes.id) : null,
+          name: st.attributes.friendly_name || "",
+          icon: st.attributes.icon || "mdi:palette-outline",
+          areaId: this._entityArea(reg[entityId]) || null,
+          selected: new Set(st.attributes.entity_id || []),
+          values: null,
+        }
+      : { entityId: null, configId: null, name: "", icon: "mdi:palette-outline", areaId, selected: null, values: null };
+    const d = this._sceneDraft;
+    if (!st) {
+      const cand = this._sceneCandidates(areaId);
+      d.selected = new Set(cand.lights);
+      d.values = ElvioScenes.capture([...cand.lights, ...cand.others], hass.states);
+    }
+    this._sceneView = "main";
+    this._sceneOthersOpen = false;
+    this._editMode = "scene";
+    this._editActions.replaceChildren();
+    this._editMsg.hidden = true;
+    this._editWrap.hidden = false;
+    this._renderSceneForm();
+    // Bestehende Szene: gespeicherte Werte holen (YAML-Szenen haben keine – dann nur ansehen).
+    if (st && d.configId) {
+      hass.callApi("GET", `config/scene/config/${d.configId}`).then(
+        (cfg) => {
+          if (this._sceneDraft !== d) return;
+          d.values = { ...ElvioScenes.capture([...d.selected], this._hass.states), ...((cfg && cfg.entities) || {}) };
+          this._renderSceneForm();
+        },
+        (err) => this._roomFormError(`Szene nicht geladen: ${setupErrText(err)}`),
+      );
+    }
+  }
+
+  // Was in eine Szene kann: Lichter des Raums, dazu Steckdosen, Lüfter, Rollläden. Ohne
+  // Bereich (Szene fürs ganze Haus) alles im Haus.
+  _sceneCandidates(areaId) {
+    const hass = this._hass;
+    const ents = areaId
+      ? this._areaEntities(areaId)
+      : Object.values(hass.entities || {}).filter((e) => !e.hidden && !e.entity_category && hass.states[e.entity_id]);
+    const ids = (re) =>
+      ents
+        .map((e) => e.entity_id)
+        .filter((id) => re.test(id))
+        .sort((a, b) => this._friendly(a).localeCompare(this._friendly(b), "de"));
+    return { lights: ids(/^light\./), others: ids(/^(switch|fan|cover)\./) };
+  }
+
+  _renderSceneForm() {
+    if (this._editMode !== "scene" || this._editWrap.hidden || !this._sceneDraft) return;
+    const d = this._sceneDraft;
+    const hass = this._hass;
+    const list = this._editList;
+    list.innerHTML = "";
+    if (this._sceneView === "icon") return this._renderSceneIconPick();
+    if (this._sceneView === "delete") return this._renderSceneDelete();
+    const room = d.areaId ? ((hass.areas || {})[d.areaId] || {}).name || d.areaId : "Ganzes Haus";
+    this._editTitle.textContent = d.entityId ? "Szene bearbeiten" : "Neue Szene";
+    this._editHint.textContent = d.entityId
+      ? `${room} · Gespeichert wird in Home Assistant.`
+      : `${room} · Je Licht einstellen, wie es in der Szene sein soll – oder die Lichter hindrehen und „Jetzigen Stand übernehmen“.`;
+    if (d.entityId && !d.configId) {
+      list.appendChild(el("div", "ehint", "Diese Szene steht in der Konfiguration von Home Assistant (YAML) und lässt sich am Tablet nicht ändern."));
+      return;
+    }
+    const name = el("input", "einput");
+    name.value = d.name;
+    name.placeholder = "Name, z. B. Abend";
+    const chips = el("div", "echips");
+    name.addEventListener("input", () => {
+      d.name = name.value;
+      for (const c of chips.children) c.classList.toggle("on", c.dataset.name === d.name.trim());
+    });
+    for (const p of ElvioScenes.presets()) {
+      const b = el("button", "echip", p.name);
+      b.dataset.name = p.name;
+      b.classList.toggle("on", d.name.trim() === p.name);
+      b.addEventListener("click", () => {
+        d.name = p.name;
+        d.icon = p.icon;
+        this._renderSceneForm();
+      });
+      chips.appendChild(b);
+    }
+    list.append(el("div", "esub", "Name"), name, chips);
+    const look = el("button", "erow epick");
+    const ic = el("div", "eicon");
+    ic.appendChild(icon(d.icon));
+    look.append(ic, el("div", "etext sname", "Symbol"), el("div", "ssub", "Ändern"));
+    look.addEventListener("click", () => {
+      this._sceneView = "icon";
+      this._renderSceneForm();
+    });
+    list.append(el("div", "esub", "Aussehen"), look);
+
+    if (!d.values) {
+      list.appendChild(el("div", "ag-empty", "Szene wird geladen …"));
+      return;
+    }
+    const cand = this._sceneCandidates(d.areaId);
+    // Geräte, die schon in der Szene stehen, aber woanders hängen, gehören trotzdem dazu.
+    const extra = [...d.selected].filter((id) => !cand.lights.includes(id) && !cand.others.includes(id));
+    const lights = [...cand.lights, ...extra.filter((id) => id.startsWith("light."))];
+    const others = [...cand.others, ...extra.filter((id) => !id.startsWith("light."))];
+    const reg = hass.entities || {};
+    list.appendChild(el("div", "esub", "Licht"));
+    if (!lights.length) list.appendChild(el("div", "ehint", "Hier gibt es keine Lichter."));
+    for (const id of lights) list.appendChild(this._sceneRow(id, d, reg));
+    if (others.length) {
+      const open = this._sceneOthersOpen || others.some((id) => d.selected.has(id));
+      list.appendChild(this._foldButton(`Steckdosen & Rollläden (${others.length})`, open, () => {
+        this._sceneOthersOpen = !open;
+        this._renderSceneForm();
+      }));
+      if (open) for (const id of others) list.appendChild(this._sceneRow(id, d, reg));
+    }
+    // Ausprobieren spielt die Einstellung ab, ohne zu speichern; „Stand übernehmen“ holt die
+    // Werte von den echten Geräten (erst Lichter einstellen, dann übernehmen).
+    const tools = el("div", "esctools");
+    const tryIt = el("button", "stextbtn", "Ausprobieren");
+    tryIt.addEventListener("click", () => {
+      const entities = this._sceneEntities(d);
+      if (Object.keys(entities).length) this._hass.callService("scene", "apply", { entities, transition: 1 });
+    });
+    const take = el("button", "stextbtn", "Jetzigen Stand übernehmen");
+    take.addEventListener("click", () => {
+      d.values = { ...d.values, ...ElvioScenes.capture([...lights, ...others], this._hass.states) };
+      this._renderSceneForm();
+    });
+    tools.append(tryIt, take);
+    list.appendChild(tools);
+    const save = el("button", "pbtn unlock esave", d.entityId ? "Speichern" : "Szene speichern");
+    save.addEventListener("click", () => this._saveScene(save));
+    list.appendChild(save);
+    if (d.entityId) {
+      const del = el("button", "stextbtn edanger", "Szene löschen");
+      del.addEventListener("click", () => {
+        this._sceneView = "delete";
+        this._renderSceneForm();
+      });
+      list.append(del);
+    }
+  }
+
+  // Was die Szene speichert: die Werte der angehakten Geräte.
+  _sceneEntities(d) {
+    const out = {};
+    for (const id of d.selected) {
+      const v = d.values[id] || ElvioScenes.capture([id], this._hass.states)[id];
+      if (v) out[id] = v;
+    }
+    return out;
+  }
+
+  // Eine Zeile im Szenen-Blatt: oben Gerät mit Schalter „in der Szene“, darunter (wenn drin)
+  // An/Aus und je nach Lampe Helligkeit, Weißton, Farbe.
+  _sceneRow(id, d, reg) {
+    const hass = this._hass;
+    const st = hass.states[id];
+    const wrap = el("div", "escrow");
+    const top = el("div", "erow");
+    const i = el("div", "eicon");
+    i.appendChild(icon(st ? st.attributes.icon || this._defaultIcon(st) : "mdi:help-circle-outline"));
+    const area = !d.areaId ? this._entityArea(reg[id]) : null;
+    const where = area ? ((hass.areas || {})[area] || {}).name : null;
+    const t = el("div", "etext");
+    t.append(el("div", "sname", this._friendly(id)), el("div", "ssub", [`jetzt ${ElvioScenes.describe(st)}`, where].filter(Boolean).join(" · ")));
+    const sw = el("button", "lswitch");
+    const inScene = d.selected.has(id);
+    sw.classList.toggle("on", inScene);
+    sw.setAttribute("aria-label", inScene ? "Aus der Szene nehmen" : "In die Szene nehmen");
+    sw.addEventListener("click", () => {
+      if (d.selected.has(id)) d.selected.delete(id);
+      else d.selected.add(id);
+      this._renderSceneForm();
+    });
+    top.append(i, t, sw);
+    wrap.appendChild(top);
+    if (!inScene) return wrap;
+
+    const v = d.values[id] || ElvioScenes.capture([id], hass.states)[id] || { state: "off" };
+    const domain = id.split(".")[0];
+    const ctl = el("div", "esc-ctl");
+    const set = (change) => {
+      d.values[id] = domain === "light" ? ElvioScenes.edit(d.values[id] || v, change) : { ...(d.values[id] || v), ...change };
+    };
+    const isOn = domain === "cover" ? v.state !== "closed" : v.state === "on";
+    const seg = el("div", "seg");
+    for (const [label, state] of domain === "cover" ? [["Offen", "open"], ["Zu", "closed"]] : [["An", "on"], ["Aus", "off"]]) {
+      const b = el("button", "", label);
+      b.classList.toggle("on", (state === "on" || state === "open") === isOn);
+      b.addEventListener("click", () => {
+        set({ state });
+        this._renderSceneForm();
+      });
+      seg.appendChild(b);
+    }
+    ctl.appendChild(seg);
+    const range = (cls, min, max, value, fmt, apply) => {
+      const box = el("label", `esc-range ${cls}`);
+      const input = el("input");
+      input.type = "range";
+      input.min = String(min);
+      input.max = String(max);
+      input.value = String(value);
+      const out = el("span", "", fmt(value));
+      input.addEventListener("input", () => (out.textContent = fmt(Number(input.value))));
+      input.addEventListener("change", () => apply(Number(input.value)));
+      box.append(input, out);
+      return box;
+    };
+    if (domain === "light" && isOn) {
+      const caps = ElvioScenes.lightCaps(st);
+      if (caps.dim) ctl.appendChild(range("bri", 1, 100, ElvioScenes.pct(v.brightness), (x) => `${x} %`, (x) => set({ brightness: ElvioScenes.bri(x) })));
+      if (caps.temp) {
+        const k = v.color_temp_kelvin || Math.round((caps.temp.min + caps.temp.max) / 2);
+        ctl.appendChild(range("temp", caps.temp.min, caps.temp.max, k, (x) => `${x} K`, (x) => set({ color_temp_kelvin: x })));
+      }
+      if (caps.color) {
+        const dots = el("div", "esc-dots");
+        for (const [name, hs] of SCENE_COLORS) {
+          const dot = el("button", "esc-dot");
+          dot.setAttribute("aria-label", name);
+          dot.style.background = `hsl(${hs[0]}, ${hs[1]}%, 55%)`;
+          dot.classList.toggle("on", v.color_mode === "hs" && Array.isArray(v.hs_color) && v.hs_color[0] === hs[0]);
+          dot.addEventListener("click", () => {
+            set({ hs_color: hs });
+            this._renderSceneForm();
+          });
+          dots.appendChild(dot);
+        }
+        ctl.appendChild(dots);
+      }
+    }
+    if (domain === "cover" && isOn) {
+      ctl.appendChild(range("bri", 0, 100, v.current_position != null ? v.current_position : 100, (x) => `${x} %`, (x) => set({ state: "open", current_position: x })));
+    }
+    wrap.appendChild(ctl);
+    return wrap;
+  }
+
+  _renderSceneIconPick() {
+    const d = this._sceneDraft;
+    this._editTitle.textContent = "Symbol wählen";
+    this._editHint.textContent = "";
+    const grid = el("div", "iconpick");
+    for (const name of SCENE_ICONS) {
+      const b = el("button", "ipick");
+      b.classList.toggle("on", d.icon === name);
+      b.setAttribute("aria-label", name.replace("mdi:", ""));
+      b.appendChild(icon(name));
+      b.addEventListener("click", () => {
+        d.icon = name;
+        this._sceneView = "main";
+        this._renderSceneForm();
+      });
+      grid.appendChild(b);
+    }
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      this._sceneView = "main";
+      this._renderSceneForm();
+    });
+    this._editList.append(grid, back);
+  }
+
+  _renderSceneDelete() {
+    const d = this._sceneDraft;
+    this._editTitle.textContent = "Szene löschen";
+    this._editHint.textContent = "";
+    const box = el("div", "cbox");
+    box.append(icon("mdi:delete-outline"), el("div", "ctitle", `„${d.name}“ löschen?`), el("div", "ctext", "Die Lichter bleiben, wie sie sind – nur die Szene verschwindet."));
+    const go = el("button", "pbtn edangerbtn", "Löschen");
+    go.addEventListener("click", () => this._deleteScene(go));
+    const back = el("button", "stextbtn", "Abbrechen");
+    back.addEventListener("click", () => {
+      this._sceneView = "main";
+      this._renderSceneForm();
+    });
+    box.append(go, back);
+    this._editList.appendChild(box);
+  }
+
+  // Speichern wie der Szenen-Editor von HA (Szenen-Datei, HA lädt danach neu). Eine neue
+  // Szene im Raum bekommt danach den Bereich – erst dann gibt es ihre Entität.
+  async _saveScene(btn) {
+    const d = this._sceneDraft;
+    const name = d.name.trim();
+    if (!name) return this._roomFormError("Bitte einen Namen eingeben.");
+    const entities = this._sceneEntities(d);
+    if (!Object.keys(entities).length) return this._roomFormError("Bitte mindestens ein Licht oder Gerät in die Szene nehmen.");
+    this._editMsg.hidden = true;
+    btn.disabled = true;
+    const id = d.configId || String(Date.now());
+    try {
+      await this._hass.callApi("POST", `config/scene/config/${id}`, { id, name, icon: d.icon, entities });
+      if (!d.entityId && d.areaId) {
+        const eid = await this._waitForScene(id);
+        if (!eid) throw new Error("Szene gespeichert, erscheint aber nicht – steht „scene: !include scenes.yaml“ in der configuration.yaml?");
+        await this._hass.callWS({ type: "config/entity_registry/update", entity_id: eid, area_id: d.areaId });
+      }
+      this._sceneDraft = null;
+      this._editWrap.hidden = true;
+    } catch (err) {
+      btn.disabled = false;
+      this._roomFormError(`Nicht gespeichert: ${setupErrText(err)}`);
+    }
+  }
+
+  async _waitForScene(configId) {
+    for (let i = 0; i < 40; i++) {
+      const st = Object.values(this._hass.states).find((x) => x.entity_id.startsWith("scene.") && String(x.attributes.id) === configId);
+      if (st) return st.entity_id;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return null;
+  }
+
+  async _deleteScene(btn) {
+    btn.disabled = true;
+    this._editMsg.hidden = true;
+    try {
+      await this._hass.callApi("DELETE", `config/scene/config/${this._sceneDraft.configId}`);
+      this._sceneDraft = null;
+      this._editWrap.hidden = true;
+    } catch (err) {
+      btn.disabled = false;
+      this._roomFormError(`Nicht gelöscht: ${setupErrText(err)}`);
+    }
   }
 
   // ───────────── Personen-Seite ─────────────
@@ -7782,6 +8355,33 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 header .pillbtn { height: 36px; padding: 0 14px 0 11px; font-size: 14px; --mdc-icon-size: 18px;
   background: rgba(0,0,0,.28); border-color: rgba(255,255,255,.3); }
 .scroller[hidden] { display: none; }
+/* Blätter mit langen Listen: Eingabefeld und Chips nicht zusammendrücken, die Liste scrollt. */
+.sresults > * { flex-shrink: 0; }
+.chips.scenechips { flex-wrap: nowrap; overflow-x: auto; max-width: none; margin-top: 10px; scrollbar-width: none;
+  -webkit-overflow-scrolling: touch; }
+.chips.scenechips::-webkit-scrollbar { display: none; }
+.chips.scenechips[hidden] { display: none; }
+.hero:has(.scenechips:not([hidden])) { max-width: none; }
+.chip.scene { flex: none; padding-right: 16px; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  transition: background .25s, color .25s; }
+.chip.scene b { font-size: 13px; }
+.chip.scene.fired { background: rgba(255,255,255,.9); color: #1f1f1f; }
+.chip.sceneadd { background: none; border-style: dashed; }
+.escrow { border-bottom: 1px solid rgba(255,255,255,.08); }
+.escrow > .erow { border-bottom: 0; }
+.esc-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 0 0 14px 48px; }
+.esc-ctl:empty { display: none; }
+.seg { display: inline-flex; padding: 3px; border-radius: 999px; background: rgba(255,255,255,.1); }
+.seg button { height: 30px; padding: 0 14px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+.seg button.on { background: rgba(255,255,255,.9); color: #1f1f1f; }
+.esc-range { flex: 1; min-width: 200px; display: flex; align-items: center; gap: 10px; }
+.esc-range input { flex: 1; min-width: 0; accent-color: #f5b450; height: 28px; }
+.esc-range.temp input { accent-color: #ffe0b0; }
+.esc-range span { flex: none; width: 58px; font-size: 12px; opacity: .8; text-align: right; font-variant-numeric: tabular-nums; }
+.esc-dots { display: flex; flex-wrap: wrap; gap: 8px; }
+.esc-dot { width: 28px; height: 28px; border-radius: 50%; border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(0,0,0,.2); }
+.esc-dot.on { border-color: #fff; }
+.esctools { display: flex; justify-content: center; gap: 28px; margin-top: 18px; }
 .tile.person { justify-content: flex-start; gap: 10px; padding: 20px 20px 18px; min-height: 160px; }
 .ptop { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .pav { width: 46px; height: 46px; flex: none; border-radius: 50%; overflow: hidden; display: grid; place-items: center;

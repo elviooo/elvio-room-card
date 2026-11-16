@@ -150,6 +150,21 @@ views:
 - Getestet mit Home Assistant 2026.11 (Stockwerke, Bereichs-Reihenfolge und Temperatursensor
   am Bereich brauchen eine aktuelle Version).
 
+## Szenen
+
+Unter dem Titel jedes Raums stehen seine Szenen als Knöpfe, auf Zuhause die Szenen fürs ganze
+Haus (ohne Bereich). Antippen aktiviert die Szene. Mit Admin-Anmeldung legt **„+ Szene“** eine
+neue an: Name (Vorlagen wie Abend, Essen, Kino, Nacht) und Symbol wählen, dann je Licht
+einstellen, wie es in der Szene sein soll – an/aus, Helligkeit, Weißton bzw. Farbe, je nachdem
+was die Lampe kann; Steckdosen und Rollläden auf Wunsch. „Ausprobieren“ spielt die Einstellung
+ab, ohne zu speichern; „Jetzigen Stand übernehmen“ holt die Werte von den echten Lichtern.
+Langes Drücken auf eine Szene öffnet sie zum Ändern oder Löschen.
+
+Es sind echte HA-Szenen (Szenen-Datei wie der Szenen-Editor von HA, `scene: !include
+scenes.yaml` in der `configuration.yaml`), am Bereich des Raums – sie funktionieren also auch
+in Automationen und per Sprache. Zuhause erkennt die Karte am ersten Leisten-Eintrag;
+`scenes: true` bzw. `scenes: false` in einer Karte zeigt bzw. versteckt die Reihe ausdrücklich.
+
 ## Personen
 
 Ein Eintrag **„Personen“** in der Leiste (hinter „Räume“) zeigt, wer wo ist – im Design der

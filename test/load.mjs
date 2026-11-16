@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
 const SRC = readFileSync(new URL("../elvio-room-card.js", import.meta.url), "utf8");
-const EXPORT = "\n;globalThis.__test = { ElvioRooms, ElvioEnergy, ElvioPeople, IMAGE_BASE, BUNDLED_IMAGES, ROOM_ICONS, AUTO_DOMAINS };";
+const EXPORT = "\n;globalThis.__test = { ElvioRooms, ElvioEnergy, ElvioPeople, ElvioScenes, IMAGE_BASE, BUNDLED_IMAGES, ROOM_ICONS, AUTO_DOMAINS };";
 
 // Ergebnisse aus der VM haben deren Array-/Object-Prototypen; kopiert sind sie normale Werte.
 const plain = (v) => (v === undefined ? v : structuredClone(v));
@@ -27,10 +27,13 @@ export function loadCard() {
   for (const [name, fn] of Object.entries(t.ElvioEnergy)) energy[name] = (...args) => plain(fn(...args));
   const people = {};
   for (const [name, fn] of Object.entries(t.ElvioPeople)) people[name] = (...args) => plain(fn(...args));
+  const scenes = {};
+  for (const [name, fn] of Object.entries(t.ElvioScenes)) scenes[name] = (...args) => plain(fn(...args));
   return {
     ElvioRooms: rooms,
     ElvioEnergy: energy,
     ElvioPeople: people,
+    ElvioScenes: scenes,
     IMAGE_BASE: t.IMAGE_BASE,
     BUNDLED_IMAGES: plain(t.BUNDLED_IMAGES),
     ROOM_ICONS: plain(t.ROOM_ICONS),
