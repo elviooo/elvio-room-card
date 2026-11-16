@@ -870,6 +870,38 @@ const sipBridge = {
   },
 };
 
+// Woher die Einrichtung Erweiterungen (Karte, kiosk-mode) holt: ab Home Assistant 2026.11 der
+// eingebaute Marketplace – er löst HACS ab und übernimmt eine HACS-Installation –, davor HACS.
+// Beide liefern dieselben Felder (id, full_name, installed_version, available_version).
+// null: weder noch, dann entfallen die Punkte.
+async function extensionStore(ws, components) {
+  if (components.includes("marketplace")) {
+    try {
+      const repos = await ws({ type: "marketplace/repositories/list", categories: ["plugin"] });
+      return {
+        name: "Marketplace",
+        repos,
+        install: (repo) =>
+          ws({ type: "marketplace/repository/install", repository: repo.id }).catch((err) => {
+            // Den Risikohinweis bestätigt jeder Admin einmal selbst – die Karte tut das nicht für ihn.
+            if (err && err.code === "warning_not_accepted") {
+              throw new Error("Erst den Marketplace in der Seitenleiste öffnen und den Hinweis bestätigen");
+            }
+            throw err;
+          }),
+      };
+    } catch (err) {
+      // Marketplace nicht geladen (oder ein HA ohne den Befehl): dann wie bisher HACS.
+      if (!(err && (err.code === "not_loaded" || err.code === "unknown_command"))) throw err;
+    }
+  }
+  if (components.includes("hacs")) {
+    const repos = await ws({ type: "hacs/repositories/list" });
+    return { name: "HACS", repos, install: (repo) => ws({ type: "hacs/repository/download", repository: repo.id }) };
+  }
+  return null;
+}
+
 class ElvioRoomCard extends HTMLElement {
   setConfig(config) {
     if (!config.title) throw new Error("title fehlt");
@@ -2621,8 +2653,8 @@ class ElvioRoomCard extends HTMLElement {
     const urlPath = dash === "lovelace" ? null : dash;
     const items = [];
 
-    let repos = null;
-    if (comps.includes("hacs")) repos = await ws({ type: "hacs/repositories/list" });
+    const store = await extensionStore(ws, comps);
+    const repos = store && store.repos;
     const repo = (name) => repos && repos.find((r) => String(r.full_name || "").toLowerCase() === name.toLowerCase());
 
     const card = repo(SETUP_CARD_REPO);
@@ -2636,7 +2668,7 @@ class ElvioRoomCard extends HTMLElement {
         done: current,
         run: async (step) => {
           step("Lade neue Version …");
-          await ws({ type: "hacs/repository/download", repository: card.id });
+          await store.install(card);
           return "reload";
         },
       });
@@ -2655,9 +2687,9 @@ class ElvioRoomCard extends HTMLElement {
         done: installed && hidden,
         run: async (step) => {
           if (!installed) {
-            if (!km) throw new Error("kiosk-mode steht nicht im HACS-Katalog");
+            if (!km) throw new Error(`kiosk-mode steht nicht im ${store.name}-Katalog`);
             step("Installiere kiosk-mode …");
-            await ws({ type: "hacs/repository/download", repository: km.id });
+            await store.install(km);
           }
           if (!hidden) {
             step("Stelle das Dashboard um …");

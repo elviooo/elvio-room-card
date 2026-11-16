@@ -4,7 +4,16 @@ Raumkarte für Home Assistant, gebaut fürs Wandtablet: Vollbild-Hintergrund, gr
 Chips und Milchglas-Kacheln für Licht, Heizung, Schlösser, Klingel, Musik, Termine und mehr.
 Eine einzige JavaScript-Datei, keine weiteren Abhängigkeiten.
 
-## Installation über HACS
+## Installation
+
+**Ab Home Assistant 2026.11 – Marketplace:** Der Marketplace ist in Home Assistant eingebaut und
+löst HACS ab (eine HACS-Installation übernimmt er). Marketplace in der Seitenleiste öffnen, den
+Hinweis einmal bestätigen → Symbol *Über einen GitHub-Link hinzufügen* →
+`https://github.com/elviooo/elvio-room-card` → **Hinzufügen** (beim ersten Mal mit GitHub
+verbinden) → **Installieren** → Browser neu laden. Der Marketplace trägt die Ressource selbst
+ein; neue Versionen erscheinen unter *Einstellungen → Updates*.
+
+**Ältere Versionen – HACS:**
 
 [![In HACS öffnen](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=elviooo&repository=elvio-room-card&category=plugin)
 
@@ -191,8 +200,8 @@ besten in einer Ansicht „Einstellungen“) prüft das und richtet es auf Knopf
 
 | Punkt | Was passiert |
 |---|---|
-| Raumkarte aktuell | Neue Version über HACS laden |
-| Seitenleiste ausblenden | [kiosk-mode](https://github.com/NemesisRE/kiosk-mode) über HACS installieren, Kopf- und Seitenleiste in diesem Dashboard ausblenden (`?disable_km` zum Bearbeiten) |
+| Raumkarte aktuell | Neue Version über den Marketplace (ab HA 2026.11) oder HACS laden |
+| Seitenleiste ausblenden | [kiosk-mode](https://github.com/NemesisRE/kiosk-mode) über den Marketplace oder HACS installieren, Kopf- und Seitenleiste in diesem Dashboard ausblenden (`?disable_km` zum Bearbeiten) |
 | Startseite für alle | Dieses Dashboard öffnet beim Start der App |
 | Räume aus Home Assistant | Nur bei alten Dashboards: sichern, Räume in die Bereiche übernehmen, auf die Ansicht `raum` umbauen |
 | Music Assistant | Add-on installieren, starten, mit Home Assistant verbinden (nur Home Assistant OS) |
@@ -204,7 +213,8 @@ besten in einer Ansicht „Einstellungen“) prüft das und richtet es auf Knopf
 
 Fehlt etwas, zeigt die Karte Admins oben einen Hinweis „2 offen“ (abschalten mit
 `setup_hint: false`). Ohne Admin-Anmeldung sieht man davon nichts, und nichts wird ungefragt
-installiert.
+installiert. Den Risikohinweis des Marketplace bestätigt jeder Admin einmal selbst im
+Marketplace; vorher meldet der Punkt genau das, statt zu installieren.
 
 ## Entwicklung
 
