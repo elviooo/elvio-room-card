@@ -31,6 +31,12 @@ const RING_ACTIVE_MS = 60000;
 // Zeitstempel, die nach einem Neuladen oder Neustart wieder auftauchen.
 const RING_FRESH_MS = 30000;
 const POPUP_AUTO_CLOSE_MS = 120000;
+// Livebild aus Einzelbildern (Kameras ohne Videostrom): Abstand zwischen zwei Bildern wie
+// bei HAs MJPEG für solche Kameras (2 je Sekunde); nach einem Fehler etwas länger warten.
+const POPUP_STILL_MS = 500;
+const POPUP_STILL_RETRY_MS = 2000;
+// CameraEntityFeature.STREAM: Die Kamera liefert Video (WebRTC/HLS), nicht nur Standbilder.
+const CAMERA_FEATURE_STREAM = 2;
 const UNLOCK_CONFIRM_MS = 5000;
 // Gegensprechen über SIP Core (Klingel-Kachel mit sip_extension): Nach dem Annehmen sendet
 // die Karte auf Wunsch eine Taste (sip_answer_dtmf). Bewusst ohne Vorgabe: Bei vielen
@@ -8769,6 +8775,15 @@ class ElvioRoomCard extends HTMLElement {
       this._popupVideo.appendChild(el("div", "pnovideo", "Keine Kamera hinterlegt"));
       return;
     }
+    // Ohne Videostrom (z. B. UniFi-Klingel ohne RTSP) bliebe in HAs Karte nur MJPEG. Lädt der
+    // Strom nicht oder bricht er ab, bleibt dort ein kaputtes Bild ohne neuen Versuch (gesehen
+    // in Safari am Mac beim Fernzugriff). Einzelbilder laden jedes für sich und fangen sich
+    // nach einem Fehler wieder; HA setzt MJPEG für solche Kameras ohnehin aus Standbildern zusammen.
+    const st = this._hass.states[cam];
+    if (st && !((st.attributes.supported_features || 0) & CAMERA_FEATURE_STREAM)) {
+      this._popupStills(cam, token);
+      return;
+    }
     const helpers = await window.loadCardHelpers();
     // Inzwischen geschlossen oder eine andere Kamera gewählt.
     if (token !== this._popupCamToken) return;
@@ -8783,6 +8798,43 @@ class ElvioRoomCard extends HTMLElement {
     card.hass = this._hass;
     this._popupCard = card;
     this._popupVideo.appendChild(card);
+  }
+
+  // Livebild aus Einzelbildern: das nächste erst, wenn das vorige da ist – eine langsame
+  // Verbindung staut nichts auf. Läuft, bis das Popup schließt oder die Kamera wechselt.
+  _popupStills(cam, token) {
+    const img = el("img", "pstill");
+    img.alt = "";
+    this._popupVideo.appendChild(img);
+    let shown = null;
+    const next = async () => {
+      if (token !== this._popupCamToken) {
+        if (shown) URL.revokeObjectURL(shown);
+        return;
+      }
+      const started = Date.now();
+      let wait = POPUP_STILL_MS;
+      try {
+        // Jedes Mal frisch aus dem Zustand: HA wechselt den Zugriffstoken alle 5 Minuten.
+        const st = this._hass.states[cam];
+        if (!st || !st.attributes.entity_picture) throw new Error("kein Standbild");
+        const res = await fetch(this._cameraUrl(st), { cache: "no-store" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const url = URL.createObjectURL(await res.blob());
+        if (token !== this._popupCamToken) {
+          URL.revokeObjectURL(url);
+          if (shown) URL.revokeObjectURL(shown);
+          return;
+        }
+        img.src = url;
+        if (shown) URL.revokeObjectURL(shown);
+        shown = url;
+      } catch {
+        wait = POPUP_STILL_RETRY_MS;
+      }
+      setTimeout(next, Math.max(0, wait - (Date.now() - started)));
+    };
+    next();
   }
 
   // Seitenverhältnis des Livebilds. Türkameras liefern oft Hochformat (z. B. 960 × 1280);
@@ -9286,6 +9338,7 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
   height: calc(100% / (1 - var(--crop-top) - var(--crop-bottom)));
   left: calc(-100% * var(--crop-left) / (1 - var(--crop-left) - var(--crop-right)));
   top: calc(-100% * var(--crop-top) / (1 - var(--crop-top) - var(--crop-bottom))); }
+.pstill { width: 100%; object-fit: cover; }
 .pnovideo { display: grid; place-items: center; height: 100%; opacity: .6; }
 .pactions { flex: none; display: flex; gap: 12px; margin-top: 16px; }
 .pbtn { flex: 1; height: 60px; border-radius: 999px; display: flex; align-items: center; justify-content: center;
