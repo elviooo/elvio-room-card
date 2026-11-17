@@ -8658,8 +8658,11 @@ class ElvioRoomCard extends HTMLElement {
     close.addEventListener("click", () => this._closeDoorbell());
     head.append(titles, close);
     this._popupVideo = el("div", "pvideo");
+    // Platz fürs Livebild; darin sitzt .pvideo im Seitenverhältnis der Kamera (CSS .pvbox).
+    this._popupVideoBox = el("div", "pvbox");
+    this._popupVideoBox.appendChild(this._popupVideo);
     this._popupActions = el("div", "pactions");
-    panel.append(head, this._popupVideo, this._popupActions);
+    panel.append(head, this._popupVideoBox, this._popupActions);
     popup.appendChild(panel);
     // Tipp neben das Fenster schließt es – nicht während eines Gesprächs (Fehlgriff).
     popup.addEventListener("click", (e) => {
@@ -8719,6 +8722,7 @@ class ElvioRoomCard extends HTMLElement {
     this._popupCamFor = cam;
     this._popupVideo.innerHTML = "";
     this._popupCard = null;
+    this._popupAspect(cam, token);
     if (!cam) {
       this._popupVideo.appendChild(el("div", "pnovideo", "Keine Kamera hinterlegt"));
       return;
@@ -8737,6 +8741,27 @@ class ElvioRoomCard extends HTMLElement {
     card.hass = this._hass;
     this._popupCard = card;
     this._popupVideo.appendChild(card);
+  }
+
+  // Seitenverhältnis des Livebilds. Türkameras liefern oft Hochformat (z. B. 960 × 1280);
+  // in einem festen 16:9-Rahmen füllt HAs Kamerabild die Breite und ragt unten heraus –
+  // zu sehen wäre nur das obere Drittel. Gemessen am Standbild, einmal je Kamera; bis
+  // dahin 16:9.
+  _popupAspect(cam, token) {
+    if (!this._camRatios) this._camRatios = {};
+    const ratios = this._camRatios;
+    const box = this._popupVideoBox;
+    box.style.setProperty("--cam-ar", String(ratios[cam] || 16 / 9));
+    const st = cam && this._hass.states[cam];
+    if (!st || !st.attributes.entity_picture || ratios[cam]) return;
+    const img = new Image();
+    img.onload = () => {
+      if (!img.naturalWidth || !img.naturalHeight) return;
+      ratios[cam] = img.naturalWidth / img.naturalHeight;
+      // Inzwischen geschlossen oder andere Kamera: nur merken.
+      if (token === this._popupCamToken) box.style.setProperty("--cam-ar", String(ratios[cam]));
+    };
+    img.src = this._cameraUrl(st);
   }
 
   // ───────────── Gegensprechen (SIP) im Klingel-Popup ─────────────
@@ -9177,21 +9202,30 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
    (30, den das Klingeln ausblendet): Wer klingelt, verdrängt jedes offene Fenster. */
 .popup { position: absolute; inset: 0; z-index: 20; display: grid; place-items: center;
   padding: calc(24px + var(--sat)) 24px calc(24px + var(--sab));
-  background: rgba(10,10,10,.45); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
+  background: rgba(10,10,10,.45); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+  container-type: size; }
 .popup[hidden] { display: none; }
-.panel { width: min(900px, 100%); border-radius: 28px; padding: 22px; color: #fff;
+/* Nie höher als der Bildschirm: Kopf und Knöpfe behalten ihre Höhe, das Livebild gibt nach. */
+.panel { width: min(900px, 100%); max-height: 100cqh; display: flex; flex-direction: column;
+  border-radius: 28px; padding: 22px; color: #fff;
   background: rgba(40,36,32,.72); border: 1px solid rgba(255,255,255,.16); }
-.phead { display: flex; align-items: center; justify-content: space-between; margin: 0 4px 16px; }
+.phead { flex: none; display: flex; align-items: center; justify-content: space-between; margin: 0 4px 16px; }
 .ptitle { font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
 .popup.rang .ptitle::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 10px;
   border-radius: 50%; background: #ff453a; vertical-align: middle; }
 .psub { font-size: 13px; opacity: .7; margin-top: 2px; }
 .pclose { width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center;
   background: rgba(255,255,255,.12); }
-.pvideo { border-radius: 18px; overflow: hidden; background: #000; aspect-ratio: 16 / 9; }
+/* Platz fürs Livebild: so hoch wie das Bild bei voller Breite, höchstens was neben Kopf und
+   Knöpfen bleibt. Darin .pvideo im Seitenverhältnis der Kamera (--cam-ar, Breite/Höhe),
+   zentriert: Hochformat wird schmaler statt unten abgeschnitten. */
+.pvbox { flex: 0 1 auto; min-height: 0; aspect-ratio: var(--cam-ar, 16 / 9); container-type: size;
+  display: grid; place-items: center; }
+.pvideo { border-radius: 18px; overflow: hidden; background: #000; aspect-ratio: var(--cam-ar, 16 / 9);
+  width: 100%; width: min(100cqw, 100cqh * var(--cam-ar, 16 / 9)); }
 .pvideo > * { display: block; height: 100%; --ha-card-border-radius: 0; --ha-card-border-width: 0; }
 .pnovideo { display: grid; place-items: center; height: 100%; opacity: .6; }
-.pactions { display: flex; gap: 12px; margin-top: 16px; }
+.pactions { flex: none; display: flex; gap: 12px; margin-top: 16px; }
 .pbtn { flex: 1; height: 60px; border-radius: 999px; display: flex; align-items: center; justify-content: center;
   gap: 10px; font-size: 17px; font-weight: 600; background: rgba(255,255,255,.14); --mdc-icon-size: 24px; }
 .pbtn.unlock { background: rgba(255,255,255,.9); color: #1f1f1f; }
