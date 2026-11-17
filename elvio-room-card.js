@@ -279,6 +279,32 @@ function setupErrText(err) {
   return (err && ((err.body && err.body.message) || err.message || err.code)) || String(err);
 }
 
+// Bildausschnitt im Klingel-Popup (camera_crop): Prozent, die je Seite wegfallen, z. B.
+// { top: 20 } schneidet das Vordach ab. Ergebnis als Anteile (0,2), ohne Angabe null.
+// Wirft bei unsinnigen Werten; mindestens 20 % des Bilds bleiben in jeder Richtung.
+const CROP_SIDES = ["top", "bottom", "left", "right"];
+function cameraCrop(crop) {
+  if (crop == null) return null;
+  if (typeof crop !== "object" || Array.isArray(crop)) {
+    throw new Error(`camera_crop: Seiten mit Prozent angeben, z. B. {top: 20}: ${JSON.stringify(crop)}`);
+  }
+  for (const side of Object.keys(crop)) {
+    if (!CROP_SIDES.includes(side)) throw new Error(`camera_crop: ${side} gibt es nicht (top, bottom, left, right)`);
+  }
+  const pct = {};
+  for (const side of CROP_SIDES) {
+    const v = crop[side] == null ? 0 : Number(crop[side]);
+    if (!Number.isFinite(v) || v < 0) throw new Error(`camera_crop: ${side} muss eine Zahl ab 0 sein: ${crop[side]}`);
+    pct[side] = v;
+  }
+  if (pct.top + pct.bottom > 80 || pct.left + pct.right > 80) {
+    throw new Error(`camera_crop: höchstens 80 % je Richtung (oben + unten, links + rechts): ${JSON.stringify(crop)}`);
+  }
+  const out = {};
+  for (const side of CROP_SIDES) out[side] = pct[side] / 100;
+  return out;
+}
+
 // ───────────── Räume aus HA-Bereichen (reine Logik, in Node testbar) ─────────────
 // Ein Raum ist ein Bereich in Home Assistant: Name, Icon, Bild, Temperatursensor, Stockwerk
 // und Reihenfolge stehen dort – der Kunde ändert sie am Tablet, Updates der Karte lassen
@@ -1763,6 +1789,12 @@ class ElvioRoomCard extends HTMLElement {
       }
       if (tile.sip_extension != null && tile.type !== "doorbell") {
         throw new Error(`sip_extension gibt es nur bei der Klingel (type: doorbell): ${JSON.stringify(tile)}`);
+      }
+      if (tile.camera_crop != null) {
+        if (tile.type !== "doorbell") {
+          throw new Error(`camera_crop gibt es nur bei der Klingel (type: doorbell): ${JSON.stringify(tile)}`);
+        }
+        cameraCrop(tile.camera_crop);
       }
       if (tile.sip_dtmf_mode && !["info", "rfc2833"].includes(String(tile.sip_dtmf_mode).toLowerCase())) {
         throw new Error(`sip_dtmf_mode muss info oder rfc2833 sein: ${tile.sip_dtmf_mode}`);
@@ -8732,7 +8764,7 @@ class ElvioRoomCard extends HTMLElement {
     this._popupCamFor = cam;
     this._popupVideo.innerHTML = "";
     this._popupCard = null;
-    this._popupAspect(cam, token);
+    this._popupAspect(cam, token, cam ? cameraCrop(cfg.camera_crop) : null);
     if (!cam) {
       this._popupVideo.appendChild(el("div", "pnovideo", "Keine Kamera hinterlegt"));
       return;
@@ -8756,12 +8788,16 @@ class ElvioRoomCard extends HTMLElement {
   // Seitenverhältnis des Livebilds. Türkameras liefern oft Hochformat (z. B. 960 × 1280);
   // in einem festen 16:9-Rahmen füllt HAs Kamerabild die Breite und ragt unten heraus –
   // zu sehen wäre nur das obere Drittel. Gemessen am Standbild, einmal je Kamera; bis
-  // dahin 16:9.
-  _popupAspect(cam, token) {
+  // dahin 16:9. Mit Ausschnitt (crop, camera_crop) gilt das Verhältnis des sichtbaren Teils;
+  // das ganze Bild liegt darin verschoben (CSS .pvideo.crop).
+  _popupAspect(cam, token, crop) {
     if (!this._camRatios) this._camRatios = {};
     const ratios = this._camRatios;
     const box = this._popupVideoBox;
-    box.style.setProperty("--cam-ar", String(ratios[cam] || 16 / 9));
+    const visible = (ar) => String(crop ? (ar * (1 - crop.left - crop.right)) / (1 - crop.top - crop.bottom) : ar);
+    this._popupVideo.classList.toggle("crop", !!crop);
+    for (const side of CROP_SIDES) box.style.setProperty(`--crop-${side}`, String(crop ? crop[side] : 0));
+    box.style.setProperty("--cam-ar", visible(ratios[cam] || 16 / 9));
     const st = cam && this._hass.states[cam];
     if (!st || !st.attributes.entity_picture || ratios[cam]) return;
     const img = new Image();
@@ -8769,7 +8805,7 @@ class ElvioRoomCard extends HTMLElement {
       if (!img.naturalWidth || !img.naturalHeight) return;
       ratios[cam] = img.naturalWidth / img.naturalHeight;
       // Inzwischen geschlossen oder andere Kamera: nur merken.
-      if (token === this._popupCamToken) box.style.setProperty("--cam-ar", String(ratios[cam]));
+      if (token === this._popupCamToken) box.style.setProperty("--cam-ar", visible(ratios[cam]));
     };
     img.src = this._cameraUrl(st);
   }
@@ -9242,6 +9278,14 @@ h1 { margin: 6px 0 16px; font-size: clamp(56px, 7.5vw, 104px); font-weight: 700;
 .pvideo { border-radius: 18px; overflow: hidden; background: #000; aspect-ratio: var(--cam-ar, 16 / 9);
   width: 100%; width: min(100cqw, 100cqh * var(--cam-ar, 16 / 9)); }
 .pvideo > * { display: block; height: 100%; --ha-card-border-radius: 0; --ha-card-border-width: 0; }
+/* Ausschnitt (camera_crop): Das ganze Bild ist größer als der Rahmen und so verschoben, dass
+   nur der gewünschte Teil zu sehen ist. --crop-*: Anteil, der je Seite wegfällt. */
+.pvideo.crop { position: relative; }
+.pvideo.crop > * { position: absolute;
+  width: calc(100% / (1 - var(--crop-left) - var(--crop-right)));
+  height: calc(100% / (1 - var(--crop-top) - var(--crop-bottom)));
+  left: calc(-100% * var(--crop-left) / (1 - var(--crop-left) - var(--crop-right)));
+  top: calc(-100% * var(--crop-top) / (1 - var(--crop-top) - var(--crop-bottom))); }
 .pnovideo { display: grid; place-items: center; height: 100%; opacity: .6; }
 .pactions { flex: none; display: flex; gap: 12px; margin-top: 16px; }
 .pbtn { flex: 1; height: 60px; border-radius: 999px; display: flex; align-items: center; justify-content: center;

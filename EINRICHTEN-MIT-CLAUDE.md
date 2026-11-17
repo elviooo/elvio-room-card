@@ -129,7 +129,7 @@ Pflicht je Karte: `title` und mindestens eine Kachel in `tiles`.
 | `entity` (Standard), `climate`, `toggle`, `camera`, `media`, `weather`, `action` | `entity` |
 | `tv` | `entity`, optional `apps: [Netflix, YouTube]` |
 | `lights` | `entities` |
-| `doorbell` | `entity` (Klingel-Ereignis), optional `camera`, `unlock` (`button.*`, `input_button.*`, `lock.*`), `ring_types`; mit SIP Core `sip_extension` (Nebenstelle der Tür in Anführungszeichen → Gegensprechen im Popup), optional `sip_answer_dtmf` (Taste nach dem Annehmen, ohne Angabe keine; nie eine Türöffner-Taste), `sip_dtmf_mode` (`info`/`rfc2833`), `sip_push_to_talk` – siehe README „Gegensprechen über SIP Core“ |
+| `doorbell` | `entity` (Klingel-Ereignis), optional `camera`, `camera_crop` (z. B. `{top: 20}`: oben 20 % des Livebilds weglassen, siehe README „Bildausschnitt der Klingel“), `unlock` (`button.*`, `input_button.*`, `lock.*`), `ring_types`; mit SIP Core `sip_extension` (Nebenstelle der Tür in Anführungszeichen → Gegensprechen im Popup), optional `sip_answer_dtmf` (Taste nach dem Annehmen, ohne Angabe keine; nie eine Türöffner-Taste), `sip_dtmf_mode` (`info`/`rfc2833`), `sip_push_to_talk` – siehe README „Gegensprechen über SIP Core“ |
 | `agenda` | `entities` (Kalender), optional `days`, `max` |
 | `energy` | `solar`, optional `price`, `home`, `grid_in`, `grid_out`, `battery`, `battery_in`, `battery_out`, `wallbox` |
 | `service` | `path`, `url` oder `config_flow`; optional `state_text` |

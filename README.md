@@ -60,7 +60,7 @@ die eigene Installation angepasst werden.
 |---|---|
 | `entity`, `climate`, `tv`, `action` | `entity` |
 | `lights` | `entities` (Liste von Lichtern) |
-| `doorbell` | `entity` (Klingel-Ereignis), optional `camera`, `unlock` (`button.*`, `input_button.*` oder `lock.*`), `sip_extension` (Gegensprechen, siehe unten) |
+| `doorbell` | `entity` (Klingel-Ereignis), optional `camera`, `camera_crop` (Bildausschnitt, siehe unten), `unlock` (`button.*`, `input_button.*` oder `lock.*`), `sip_extension` (Gegensprechen, siehe unten) |
 | `agenda` | `entities` (Kalender), optional `days`, `max` |
 | `energy` | `solar` |
 | `service` | `path`, `url` oder `config_flow` |
@@ -239,6 +239,23 @@ nur, wenn es die Daten gibt:
 
 Nur Anzeige – gesteuert wird nichts. Verbraucher einzeln einzutragen erspart der
 Einrichtungspunkt „Energie einrichten“.
+
+## Bildausschnitt der Klingel
+
+Das Klingel-Popup zeigt das ganze Kamerabild. Ragt oben ein Vordach oder die Wand ins Bild,
+schneidet `camera_crop` ein Stück weg – in Prozent je Seite (`top`, `bottom`, `left`, `right`,
+je Richtung zusammen höchstens 80):
+
+```yaml
+- type: doorbell
+  name: Haustür
+  entity: input_text.klingel
+  camera: camera.haustuer
+  camera_crop: {top: 20}            # oberes Fünftel weglassen, das Bild beginnt tiefer
+```
+
+Mehr als die Kamera sieht, zeigt auch der Ausschnitt nicht: Unter dem unteren Bildrand geht es
+nur weiter, wenn die Kamera selbst tiefer zeigt.
 
 ## Gegensprechen über SIP Core
 
