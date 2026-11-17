@@ -126,6 +126,20 @@ test("roomsBasePath: /<dashboard>/raum oder rooms_path", () => {
   assert.equal(R.roomsBasePath("/dashboard-tablet/garten", "/x/zimmer"), "/x/zimmer");
 });
 
+test("sameDashboard: nur Sprünge im selben Dashboard gehen ohne Neuladen", () => {
+  const from = "/dashboard-tablet/zuhause";
+  assert.equal(R.sameDashboard(from, "/dashboard-tablet/raum?bereich=bad"), true);
+  assert.equal(R.sameDashboard(from, "/dashboard-tablet/einstellungen#x"), true);
+  assert.equal(R.sameDashboard(from, "raum"), true);
+  // Raus in die HA-Oberfläche: dort räumt kiosk-mode seine Styles nicht weg.
+  assert.equal(R.sameDashboard(from, "/lovelace/0"), false);
+  assert.equal(R.sameDashboard(from, "/home/overview"), false);
+  assert.equal(R.sameDashboard(from, "/config/integrations/dashboard/add?domain=sonos"), false);
+  assert.equal(R.sameDashboard(from, "/dashboard-tablett/zuhause"), false);
+  assert.equal(R.sameDashboard(from, "https://example.org/"), false);
+  assert.equal(R.sameDashboard("/", "/lovelace/raum"), true);
+});
+
 test("swap: tauscht zwei IDs, Rest bleibt", () => {
   assert.deepEqual(R.swap(["a", "b", "c", "d"], "b", "d"), ["a", "d", "c", "b"]);
   assert.deepEqual(R.swap(["a", "b"], "a", "zz"), ["a", "b"]);

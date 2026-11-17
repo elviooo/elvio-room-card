@@ -430,6 +430,16 @@ const ElvioRooms = {
     return `/${dash}/raum`;
   },
 
+  // Bleibt ein Sprung im selben Dashboard (erstes Pfadstück)? Nur dann ohne Neuladen –
+  // siehe _navigate.
+  sameDashboard(from, to) {
+    const target = String(to || "");
+    if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return false;
+    if (!target.startsWith("/")) return true;
+    const dash = (p) => p.split(/[?#]/)[0].split("/")[1] || "lovelace";
+    return dash(String(from || "")) === dash(target);
+  },
+
   swap(ids, a, b) {
     const out = [...ids];
     const i = out.indexOf(a);
@@ -9029,8 +9039,16 @@ class ElvioRoomCard extends HTMLElement {
     return path && window.location.pathname === path;
   }
 
+  // Im selben Dashboard ohne Neuladen. Wer es verlässt, lädt die Seite neu: kiosk-mode
+  // versteckt Seitenleiste und Kopfzeile mit eingefügten Styles und nimmt sie nur auf
+  // Dashboards wieder heraus. In der HA-Übersicht (/home) oder den Einstellungen blieben
+  // sie sonst stehen – ohne Seitenleiste kommt dort niemand weiter.
   _navigate(path) {
     if (!path) return;
+    if (!ElvioRooms.sameDashboard(window.location.pathname, path)) {
+      window.location.assign(path);
+      return;
+    }
     history.pushState(null, "", path);
     window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: false } }));
   }
