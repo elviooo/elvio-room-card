@@ -311,6 +311,56 @@ function cameraCrop(crop) {
   return out;
 }
 
+// Verbindung der Seite zu HA prüfen (hass.connection, home-assistant-js-websocket). Nach
+// längerer Zeit im Hintergrund (iPhone-App) kann sie offen aussehen, liefert aber nichts mehr:
+// keine Zustände, kein Videostrom – das Kamerabild bleibt weiß bis zum Neuladen. Antwortet
+// sie nicht auf ping, wird sie erzwungen neu aufgebaut. Ergebnis true, wenn danach (oder nach
+// HAs eigenem Neuverbinden) wieder eine frische Verbindung steht – dann lohnt ein neuer Versuch.
+// Mehrere Karten auf einer Seite teilen sich eine laufende Prüfung.
+const CONN_PING_MS = 4000;
+const CONN_READY_MS = 10000;
+const connChecks = new WeakMap();
+function ensureConnection(conn, { pingMs = CONN_PING_MS, readyMs = CONN_READY_MS } = {}) {
+  if (!conn) return Promise.resolve(false);
+  if (connChecks.has(conn)) return connChecks.get(conn);
+  const waitReady = () =>
+    new Promise((resolve) => {
+      let timer;
+      const done = (ok) => {
+        clearTimeout(timer);
+        conn.removeEventListener("ready", onReady);
+        resolve(ok);
+      };
+      const onReady = () => done(true);
+      conn.addEventListener("ready", onReady);
+      timer = setTimeout(() => done(!!conn.connected), readyMs);
+    });
+  const check = (async () => {
+    if (conn.connected) {
+      let timer;
+      const answered = await Promise.race([
+        conn.ping().then(
+          () => true,
+          () => false,
+        ),
+        new Promise((resolve) => (timer = setTimeout(() => resolve(false), pingMs))),
+      ]);
+      clearTimeout(timer);
+      if (answered) return false;
+      conn.reconnect(true);
+    }
+    return waitReady();
+  })();
+  connChecks.set(conn, check);
+  check.then(() => connChecks.delete(conn));
+  return check;
+}
+
+// Nach dem Neuverbinden baut HA das Dashboard meist neu auf: Die alte Karte fliegt raus und
+// schließt dabei ihr Klingel-Popup. Die neue Karte mit derselben Klingel öffnet es wieder.
+const POPUP_HANDOVER_MS = 15000;
+const popupHandover = { cfg: null, rang: false, until: 0, from: null };
+
 // ───────────── Räume aus HA-Bereichen (reine Logik, in Node testbar) ─────────────
 // Ein Raum ist ein Bereich in Home Assistant: Name, Icon, Bild, Temperatursensor, Stockwerk
 // und Reihenfolge stehen dort – der Kunde ändert sie am Tablet, Updates der Karte lassen
@@ -1852,6 +1902,7 @@ class ElvioRoomCard extends HTMLElement {
     }
     if (!this._built) this._build();
     this._update();
+    this._takeOverPopup();
     this._maybePickRoom();
     // Rückfall für die gemeinsame Raum-Ansicht: Hat die Karte einen Wechsel von ?bereich= nicht
     // mitbekommen (HA hält Ansichten vor, abgehängt hört sie nichts), holt sie ihn hier nach.
@@ -1893,9 +1944,16 @@ class ElvioRoomCard extends HTMLElement {
     const energyOpen = this._energyWrap && !this._energyWrap.hidden;
     const peopleOpen = this._peopleWrap && !this._peopleWrap.hidden;
     const viewsOpen = open && this._editMode === "views";
+    // Offenes Klingel-Popup (z. B. es klingelt gerade, oder nach dem Neuverbinden übernommen)
+    // bleibt offen. Ein Gespräch über SIP stellt sipBridge selbst wieder her.
+    const bell =
+      this._popup && !this._popup.hidden && !this._sipView && this._popupCamCfg
+        ? { cfg: this._popupCamCfg, rang: this._popup.classList.contains("rang") }
+        : null;
     this._build(true);
     this._update();
     this._scroller.scrollTop = top;
+    if (bell) this._openDoorbell(bell.cfg, bell.rang);
     if (editing) this._openEdit();
     if (adding) this._showAdd();
     if (energyOpen) this._openEnergy(true);
@@ -2169,6 +2227,12 @@ class ElvioRoomCard extends HTMLElement {
     // gehört hat (sie war abgehängt): sonst stünde noch der vorige Raum da.
     this._locationChanged();
     sipBridge.attach(this);
+    // Zurück aus dem Hintergrund (iPhone-App, Tablet nach dem Ruhezustand): Verbindung prüfen,
+    // bevor jemand vor eingefrorenen Kacheln oder einem weißen Kamerabild steht.
+    this._onVisible = () => {
+      if (document.visibilityState === "visible") this._checkConnection();
+    };
+    document.addEventListener("visibilitychange", this._onVisible);
   }
 
   disconnectedCallback() {
@@ -2184,6 +2248,7 @@ class ElvioRoomCard extends HTMLElement {
     // Ein laufendes Gespräch geht weiter – die nächste sichtbare Karte übernimmt das Popup.
     window.removeEventListener("location-changed", this._onLocation);
     window.removeEventListener("popstate", this._onLocation);
+    document.removeEventListener("visibilitychange", this._onVisible);
     // Zurück auf /raum ohne Raum soll die Raumübersicht wieder aufgehen.
     this._pickedFor = null;
     sipBridge.detach(this);
@@ -8768,6 +8833,7 @@ class ElvioRoomCard extends HTMLElement {
     if (reuse && this._popupCamFor === cam) return;
     const token = (this._popupCamToken = (this._popupCamToken || 0) + 1);
     this._popupCamFor = cam;
+    this._popupCamCfg = cfg;
     this._popupVideo.innerHTML = "";
     this._popupCard = null;
     this._popupAspect(cam, token, cam ? cameraCrop(cfg.camera_crop) : null);
@@ -8775,6 +8841,9 @@ class ElvioRoomCard extends HTMLElement {
       this._popupVideo.appendChild(el("div", "pnovideo", "Keine Kamera hinterlegt"));
       return;
     }
+    // Läuft parallel: Ist die Verbindung eingeschlafen, startet der Videostrom nie (weißes
+    // Feld bis zum Neuladen). Nach dem Neuverbinden baut _checkConnection das Bild neu auf.
+    this._checkConnection();
     // Ohne Videostrom (z. B. UniFi-Klingel ohne RTSP) bliebe in HAs Karte nur MJPEG. Lädt der
     // Strom nicht oder bricht er ab, bleibt dort ein kaputtes Bild ohne neuen Versuch (gesehen
     // in Safari am Mac beim Fernzugriff). Einzelbilder laden jedes für sich und fangen sich
@@ -8815,10 +8884,10 @@ class ElvioRoomCard extends HTMLElement {
       const started = Date.now();
       let wait = POPUP_STILL_MS;
       try {
-        // Jedes Mal frisch aus dem Zustand: HA wechselt den Zugriffstoken alle 5 Minuten.
-        const st = this._hass.states[cam];
-        if (!st || !st.attributes.entity_picture) throw new Error("kein Standbild");
-        const res = await fetch(this._cameraUrl(st), { cache: "no-store" });
+        if (!this._hass.states[cam]) throw new Error("Kamera fehlt");
+        // Mit der Anmeldung der Seite, nicht dem Zugriffstoken aus dem Kamerazustand: der
+        // wechselt alle 5 Minuten und ist veraltet, wenn die Seite eine Weile keine Updates bekam.
+        const res = await this._hass.fetchWithAuth(`/api/camera_proxy/${cam}`, { cache: "no-store" });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const url = URL.createObjectURL(await res.blob());
         if (token !== this._popupCamToken) {
@@ -8850,16 +8919,55 @@ class ElvioRoomCard extends HTMLElement {
     this._popupVideo.classList.toggle("crop", !!crop);
     for (const side of CROP_SIDES) box.style.setProperty(`--crop-${side}`, String(crop ? crop[side] : 0));
     box.style.setProperty("--cam-ar", visible(ratios[cam] || 16 / 9));
-    const st = cam && this._hass.states[cam];
-    if (!st || !st.attributes.entity_picture || ratios[cam]) return;
-    const img = new Image();
-    img.onload = () => {
-      if (!img.naturalWidth || !img.naturalHeight) return;
-      ratios[cam] = img.naturalWidth / img.naturalHeight;
-      // Inzwischen geschlossen oder andere Kamera: nur merken.
-      if (token === this._popupCamToken) box.style.setProperty("--cam-ar", visible(ratios[cam]));
-    };
-    img.src = this._cameraUrl(st);
+    if (!cam || !this._hass.states[cam] || ratios[cam]) return;
+    // Standbild mit der Anmeldung der Seite (wie _popupStills), nicht über den Token im Zustand.
+    this._hass
+      .fetchWithAuth(`/api/camera_proxy/${cam}`, { cache: "no-store" })
+      .then((res) => (res.ok ? res.blob() : null))
+      .then((blob) => blob && createImageBitmap(blob))
+      .then((bmp) => {
+        if (!bmp) return;
+        const { width, height } = bmp;
+        if (bmp.close) bmp.close();
+        if (!width || !height) return;
+        ratios[cam] = width / height;
+        // Inzwischen geschlossen oder andere Kamera: nur merken.
+        if (token === this._popupCamToken) box.style.setProperty("--cam-ar", visible(ratios[cam]));
+      })
+      .catch(() => {});
+  }
+
+  // Verbindung prüfen (ensureConnection). Musste sie neu aufgebaut werden, lädt ein offenes
+  // Klingel-Popup sein Livebild neu – der alte Versuch hing an der toten Verbindung.
+  async _checkConnection() {
+    const token = this._popupCamToken;
+    const reconnected = await ensureConnection(this._hass && this._hass.connection);
+    if (!reconnected || token !== this._popupCamToken || !this._popupCamCfg) return;
+    // Ein Gespräch über SIP hält sipBridge auch über einen Kartenwechsel hinweg.
+    if (!this._popup || this._popup.hidden || this._sipView) return;
+    Object.assign(popupHandover, {
+      cfg: this._popupCamCfg,
+      rang: this._popup.classList.contains("rang"),
+      until: Date.now() + POPUP_HANDOVER_MS,
+      from: this,
+    });
+    if (this.isConnected) this._popupCamera(this._popupCamCfg, false);
+  }
+
+  // Gegenstück zu _checkConnection: Popup der ausgetauschten Karte wieder öffnen. Die alte
+  // Karte selbst übernimmt nicht – bleibt sie stehen, läuft die Übergabe einfach ab.
+  _takeOverPopup() {
+    const h = popupHandover;
+    if (!h.cfg || h.from === this) return;
+    if (Date.now() > h.until) {
+      h.cfg = h.from = null;
+      return;
+    }
+    if (!this.isConnected || !this._popup || !this._popup.hidden) return;
+    if (!this._doorbellTiles().some((t) => t.camera === h.cfg.camera && t.entity === h.cfg.entity)) return;
+    const { cfg, rang } = h;
+    h.cfg = h.from = null;
+    this._openDoorbell(cfg, rang);
   }
 
   // ───────────── Gegensprechen (SIP) im Klingel-Popup ─────────────
@@ -8867,9 +8975,14 @@ class ElvioRoomCard extends HTMLElement {
   // Klingel-Kacheln dieser Karte mit sip_extension (Rohkonfiguration: auch wenn die
   // Klingel-Entität gerade ausgeblendet ist).
   _sipTiles() {
+    return this._doorbellTiles().filter((t) => t.sip_extension != null && t.sip_extension !== "");
+  }
+
+  // Alle Klingel-Kacheln dieser Karte (Rohkonfiguration, auch ausgeblendete).
+  _doorbellTiles() {
     const c = this._rawConfig || {};
     return [...(c.tiles || []), ...(c.sections || []).flatMap((s) => (s && s.tiles) || [])].filter(
-      (t) => t && t.type === "doorbell" && t.sip_extension != null && t.sip_extension !== "",
+      (t) => t && t.type === "doorbell",
     );
   }
 
@@ -9075,6 +9188,8 @@ class ElvioRoomCard extends HTMLElement {
   // Schließt nur das Fenster. Ein SIP-Gespräch beenden die Knöpfe Ablehnen/Auflegen;
   // währenddessen gibt es weder „×“ noch Tipp-daneben-zu.
   _closeDoorbell() {
+    // Selbst geschlossen (nicht ausgehängt, siehe disconnectedCallback): nichts mehr übergeben.
+    if (popupHandover.from === this && this.isConnected) popupHandover.cfg = popupHandover.from = null;
     clearTimeout(this._popupTimer);
     clearTimeout(this._sipEndTimer);
     this._sipView = null;
@@ -9085,6 +9200,7 @@ class ElvioRoomCard extends HTMLElement {
     // Karte entfernen beendet den Stream; ein noch ladendes Livebild verfällt.
     this._popupCamToken = (this._popupCamToken || 0) + 1;
     this._popupCamFor = undefined;
+    this._popupCamCfg = null;
     if (this._popupVideo) this._popupVideo.innerHTML = "";
     this._popupCard = null;
   }

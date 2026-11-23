@@ -257,6 +257,17 @@ je Richtung zusammen höchstens 80):
 Mehr als die Kamera sieht, zeigt auch der Ausschnitt nicht: Unter dem unteren Bildrand geht es
 nur weiter, wenn die Kamera selbst tiefer zeigt.
 
+### Livebild nach langer Zeit im Hintergrund
+
+Liegt das Dashboard lange im Hintergrund (iPhone-App, Tablet im Ruhezustand), kann die
+Verbindung zu Home Assistant eingeschlafen sein, obwohl sie offen aussieht. Dann startet kein
+Videostrom, und das Livebild bliebe leer bis zum Neuladen der Seite. Die Karte prüft die
+Verbindung deshalb beim Öffnen des Klingel-Popups und wenn die Seite wieder in den Vordergrund
+kommt. Antwortet sie nicht, baut die Karte sie neu auf. Das dauert ein paar Sekunden. Baut HA
+danach das Dashboard neu auf, bleibt das Popup offen. Kameras ohne Videostrom zeigen
+Einzelbilder, die mit der Anmeldung der Seite geladen werden und nicht vom Stand der Verbindung
+abhängen.
+
 ## Gegensprechen über SIP Core
 
 Mit [SIP Core](https://github.com/TECH7Fox/sipcore-hass-integration) (HACS, getestet mit
